@@ -374,15 +374,13 @@ impl QuotaStore {
         }
 
         for target in registry.discovery_targets() {
-            if target.model_id.is_none() {
-                continue;
-            }
             let Some(collector) = registry.collector_for(&target) else {
                 continue;
             };
-            if active_collector_id
+            if (active_collector_id
                 .as_ref()
                 .is_some_and(|active_id| *active_id == collector.id())
+                && target.model_id.is_none())
                 || targets.contains(&target)
             {
                 continue;
@@ -1164,7 +1162,7 @@ mod tests {
     async fn popover_targets_keep_active_collector_once(cx: &mut TestAppContext) {
         let active_collector = FakeCollector::new("active", "provider-a")
             .with_discovery_target(model_less_target("provider-a"));
-        let other_target = target("provider-b", "model-b");
+        let other_target = model_less_target("provider-b");
         let other_collector =
             FakeCollector::new("other", "provider-b").with_discovery_target(other_target.clone());
         let fixture = fixture_with_collectors(cx, vec![active_collector, other_collector]);
