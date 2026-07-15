@@ -6,7 +6,7 @@ use ai_usage::{QuotaSnapshot, QuotaView, QuotaWindow};
 use fs::Fs;
 use gpui::{App, Context, Div, Entity, IntoElement, Render, Subscription, Window, div, px};
 use project::ProjectEntryId;
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use ui::{ButtonLike, CircularProgress, Icon, PopoverMenu, PopoverMenuHandle, prelude::*};
 use util::ResultExt as _;
 use workspace::Workspace;
@@ -48,7 +48,7 @@ pub(crate) struct ContextUsageData {
 pub(crate) struct ContextQuotaIndicator {
     target: ActiveQuotaTarget,
     store: Entity<ai_usage::QuotaStore>,
-    _fs: Arc<dyn Fs>,
+    fs: Arc<dyn Fs>,
     menu_handle: PopoverMenuHandle<QuotaPopover>,
     context_usage: Option<ContextUsageData>,
     _subscriptions: Vec<Subscription>,
@@ -63,13 +63,14 @@ impl ContextQuotaIndicator {
     ) -> Self {
         store.update(cx, |store, cx| store.activate(target.0.clone(), cx));
         let store_subscription = cx.observe(&store, |_, _, cx| cx.notify());
+        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         Self {
             target,
             store,
-            _fs: fs,
+            fs,
             menu_handle: PopoverMenuHandle::default(),
             context_usage: None,
-            _subscriptions: vec![store_subscription],
+            _subscriptions: vec![store_subscription, settings_subscription],
         }
     }
 
@@ -97,6 +98,10 @@ impl ContextQuotaIndicator {
     ) {
         self.context_usage = context_usage;
         cx.notify();
+    }
+
+    pub(crate) fn context_usage(&self) -> Option<ContextUsageData> {
+        self.context_usage.clone()
     }
 
     fn view(&self, cx: &mut Context<Self>) -> Option<QuotaView> {
@@ -160,15 +165,30 @@ impl ContextQuotaIndicator {
                 }
             });
 
-        let target = self.target.0.clone();
         let store = self.store.clone();
+        let active_target = self.target.clone();
+        let context_source = cx.entity().downgrade();
+        let fs = self.fs.clone();
         PopoverMenu::new("context-quota-popover")
             .trigger(trigger)
             .menu(move |_window, cx| {
-                Some(cx.new(|cx| QuotaPopover::new(target.clone(), store.clone(), cx)))
+                Some(cx.new(|cx| {
+                    QuotaPopover::new_with_context_source(
+                        Some(active_target.clone()),
+                        None,
+                        store.clone(),
+                        Some(fs.clone()),
+                        Some(context_source.clone()),
+                        cx,
+                    )
+                }))
             })
             .with_handle(self.menu_handle.clone())
-            .anchor(gpui::Anchor::BottomRight)
+            .anchor(gpui::Anchor::BottomLeft)
+            .offset(gpui::Point {
+                x: px(0.0),
+                y: px(-2.0),
+            })
             .into_any_element()
     }
 
