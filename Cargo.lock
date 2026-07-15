@@ -376,6 +376,7 @@ dependencies = [
  "acp_thread",
  "action_log",
  "agent-client-protocol",
+ "ai_usage",
  "anyhow",
  "async-channel 2.5.0",
  "chrono",
@@ -9835,6 +9836,7 @@ name = "language_models"
 version = "0.1.0"
 dependencies = [
  "ai_onboarding",
+ "ai_usage",
  "anthropic",
  "anyhow",
  "async-lock",

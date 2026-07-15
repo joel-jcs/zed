@@ -33,7 +33,24 @@ use crate::provider::vercel_ai_gateway::VercelAiGatewayLanguageModelProvider;
 use crate::provider::x_ai::XAiLanguageModelProvider;
 pub use crate::settings::*;
 
+pub fn quota_target_for_model(
+    model: &Arc<dyn language_model::LanguageModel>,
+) -> ai_usage::QuotaTarget {
+    ai_usage::QuotaTarget {
+        kind: ai_usage::QuotaTargetKind::NativeLanguageModel,
+        provider_or_agent_id: Arc::from(model.provider_id().0.as_ref()),
+        upstream_provider_id: Some(Arc::from(model.upstream_provider_id().0.as_ref())),
+        model_id: Some(Arc::from(model.id().0.as_ref())),
+        model_name: Some(model.name().0.clone()),
+    }
+}
+
+pub fn register_quota_collector(collector: Arc<dyn ai_usage::QuotaCollector>, cx: &mut App) {
+    ai_usage::register_collector(collector, cx);
+}
+
 pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
+    ai_usage::init(client.http_client(), cx);
     let credentials_provider = client.credentials_provider();
     let registry = LanguageModelRegistry::global(cx);
     registry.update(cx, |registry, cx| {
@@ -333,29 +350,134 @@ fn register_language_model_providers(
         cx,
     );
     registry.register_provider(Arc::new(CopilotChatLanguageModelProvider::new(cx)), cx);
-    registry.register_provider(
-        Arc::new(OpenAiSubscribedProvider::new(
-            client.http_client(),
-            credentials_provider,
-            cx,
-        )),
+    let provider = Arc::new(OpenAiSubscribedProvider::new(
+        client.http_client(),
+        credentials_provider,
         cx,
-    );
+    ));
+    register_quota_collector(provider.quota_collector(), cx);
+    registry.register_provider(provider, cx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_usage::{QuotaAccount, QuotaCacheKey, QuotaCacheScope};
     use anyhow::Result;
     use clock::FakeSystemClock;
     use feature_flags::FeatureFlagAppExt as _;
+    use futures::{future::BoxFuture, stream::BoxStream};
     use gpui::{AppContext as _, AsyncApp, BorrowAppContext as _};
     use http_client::FakeHttpClient;
-    use language_model::IconOrSvg;
+    use language_model::{
+        IconOrSvg, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
+        LanguageModelId, LanguageModelName, LanguageModelProviderId, LanguageModelProviderName,
+        LanguageModelRequest, LanguageModelToolChoice, fake_provider::FakeLanguageModel,
+    };
     use release_channel::AppVersion;
     use std::future::Future;
     use std::pin::Pin;
     use ui::IconName;
+
+    struct UpstreamModel {
+        inner: FakeLanguageModel,
+        upstream_provider_id: LanguageModelProviderId,
+    }
+
+    impl LanguageModel for UpstreamModel {
+        fn id(&self) -> LanguageModelId {
+            self.inner.id()
+        }
+
+        fn name(&self) -> LanguageModelName {
+            self.inner.name()
+        }
+
+        fn provider_id(&self) -> LanguageModelProviderId {
+            self.inner.provider_id()
+        }
+
+        fn provider_name(&self) -> LanguageModelProviderName {
+            self.inner.provider_name()
+        }
+
+        fn upstream_provider_id(&self) -> LanguageModelProviderId {
+            self.upstream_provider_id.clone()
+        }
+
+        fn telemetry_id(&self) -> String {
+            self.inner.telemetry_id()
+        }
+
+        fn supports_images(&self) -> bool {
+            self.inner.supports_images()
+        }
+
+        fn supports_tools(&self) -> bool {
+            self.inner.supports_tools()
+        }
+
+        fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
+            self.inner.supports_tool_choice(choice)
+        }
+
+        fn max_token_count(&self) -> u64 {
+            self.inner.max_token_count()
+        }
+
+        fn stream_completion(
+            &self,
+            request: LanguageModelRequest,
+            cx: &AsyncApp,
+        ) -> BoxFuture<
+            'static,
+            Result<
+                BoxStream<
+                    'static,
+                    Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+                >,
+                LanguageModelCompletionError,
+            >,
+        > {
+            self.inner.stream_completion(request, cx)
+        }
+    }
+
+    #[test]
+    fn quota_target_preserves_provider_and_upstream_ids() {
+        let model = Arc::new(UpstreamModel {
+            inner: FakeLanguageModel::with_id_and_thinking("adapter", "model", "Model", false),
+            upstream_provider_id: LanguageModelProviderId::from("upstream".to_string()),
+        }) as Arc<dyn LanguageModel>;
+
+        let target = quota_target_for_model(&model);
+
+        assert_eq!(target.provider_or_agent_id.as_ref(), "adapter");
+        assert_eq!(target.upstream_provider_id.as_deref(), Some("upstream"));
+        assert_eq!(target.model_id.as_deref(), Some("model"));
+        assert_eq!(target.model_name.as_deref(), Some("Model"));
+    }
+
+    #[test]
+    fn native_and_acp_use_distinct_credential_sources() {
+        let native_account = QuotaAccount::from_stable_identity(
+            "openai-subscribed",
+            b"identical-account-identity",
+            None,
+        );
+        let acp_account =
+            QuotaAccount::from_stable_identity("codex-acp", b"identical-account-identity", None);
+        let key = |account: &QuotaAccount| QuotaCacheKey {
+            collector_id: Arc::from("collector"),
+            credential_source: account.credential_source.clone(),
+            account_fingerprint: account.fingerprint.clone(),
+            provider_or_agent_id: Arc::from("provider"),
+            scope: QuotaCacheScope::Account,
+        };
+
+        assert_ne!(key(&native_account), key(&acp_account));
+        assert_eq!(native_account.fingerprint, acp_account.fingerprint);
+    }
 
     struct FakeCredentialsProvider;
 

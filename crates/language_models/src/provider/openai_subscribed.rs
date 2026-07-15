@@ -1,3 +1,7 @@
+use ai_usage::{
+    CodexQuotaSource, QuotaAccount, QuotaCacheScope, QuotaCollector, QuotaError, QuotaFetchContext,
+    QuotaTarget, QuotaTargetKind,
+};
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -102,6 +106,17 @@ pub struct OpenAiSubscribedProvider {
     state: Entity<State>,
 }
 
+struct OpenAiSubscribedQuotaCollector {
+    state: gpui::WeakEntity<State>,
+    http_client: Arc<dyn HttpClient>,
+}
+
+impl OpenAiSubscribedQuotaCollector {
+    fn new(state: gpui::WeakEntity<State>, http_client: Arc<dyn HttpClient>) -> Self {
+        Self { state, http_client }
+    }
+}
+
 impl OpenAiSubscribedProvider {
     pub fn new(
         http_client: Arc<dyn HttpClient>,
@@ -123,6 +138,13 @@ impl OpenAiSubscribedProvider {
         provider.load_credentials(cx);
 
         provider
+    }
+
+    pub(crate) fn quota_collector(&self) -> Arc<dyn QuotaCollector> {
+        Arc::new(OpenAiSubscribedQuotaCollector::new(
+            self.state.downgrade(),
+            self.http_client.clone(),
+        ))
     }
 
     fn load_credentials(&self, cx: &mut App) {
@@ -165,6 +187,148 @@ impl OpenAiSubscribedProvider {
             http_client: self.http_client.clone(),
             request_limiter: RateLimiter::new(4),
         })
+    }
+}
+
+impl QuotaCollector for OpenAiSubscribedQuotaCollector {
+    fn id(&self) -> Arc<str> {
+        Arc::from(PROVIDER_ID.0.as_ref())
+    }
+
+    fn display_name(&self) -> SharedString {
+        PROVIDER_NAME.0.clone()
+    }
+
+    fn supports(&self, target: &QuotaTarget) -> bool {
+        target.kind == QuotaTargetKind::NativeLanguageModel
+            && target.provider_or_agent_id.as_ref() == PROVIDER_ID.0.as_ref()
+    }
+
+    fn minimum_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+
+    fn discovery_target(&self) -> Option<QuotaTarget> {
+        Some(QuotaTarget {
+            kind: QuotaTargetKind::NativeLanguageModel,
+            provider_or_agent_id: Arc::from(PROVIDER_ID.0.as_ref()),
+            upstream_provider_id: None,
+            model_id: None,
+            model_name: None,
+        })
+    }
+
+    fn model_match_id(&self, target: &QuotaTarget) -> Option<Arc<str>> {
+        target
+            .model_id
+            .as_deref()
+            .map(ai_usage::normalize_codex_model_id)
+    }
+
+    fn cache_scope(&self, _target: &QuotaTarget, _account: &QuotaAccount) -> QuotaCacheScope {
+        QuotaCacheScope::Account
+    }
+
+    fn resolve_account(
+        &self,
+        _target: QuotaTarget,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<QuotaAccount, QuotaError>> {
+        let state = self.state.clone();
+        let http_client = self.http_client.clone();
+        let task = cx.spawn(async move |mut cx| {
+            await_initial_credential_load(&state, &mut cx)
+                .await
+                .map_err(quota_error)?;
+            get_fresh_credentials(&state, &http_client, &mut cx)
+                .await
+                .map(|credentials| account_for_credentials(&credentials))
+                .map_err(quota_error)
+        });
+        Box::pin(async move { task.await })
+    }
+
+    fn fetch(
+        &self,
+        target: QuotaTarget,
+        account: QuotaAccount,
+        context: QuotaFetchContext,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<ai_usage::QuotaSnapshot, QuotaError>> {
+        let state = self.state.clone();
+        let http_client = self.http_client.clone();
+        let task = cx.spawn(async move |mut cx| {
+            await_initial_credential_load(&state, &mut cx)
+                .await
+                .map_err(quota_error)?;
+            get_fresh_credentials(&state, &http_client, &mut cx)
+                .await
+                .map_err(quota_error)
+        });
+        Box::pin(async move {
+            let credentials = task.await?;
+            if account_for_credentials(&credentials) != account {
+                return Err(QuotaError::AmbiguousAccount);
+            }
+            ai_usage::fetch_codex_snapshot(
+                &context.http_client,
+                &credentials.access_token,
+                credentials.account_id.as_deref(),
+                &target,
+                CodexQuotaSource {
+                    provider_id: Arc::from(PROVIDER_ID.0.as_ref()),
+                    provider_name: PROVIDER_NAME.0.clone(),
+                    authentication_error: AUTHENTICATION_ERROR.into(),
+                },
+            )
+            .await
+        })
+    }
+}
+
+const AUTHENTICATION_ERROR: &str = "ChatGPT Subscription session expired; sign in again";
+const RATE_LIMIT_ERROR: &str = "ChatGPT Subscription quota refresh is rate limited";
+const PROVIDER_ERROR: &str = "ChatGPT Subscription quota provider error";
+
+async fn await_initial_credential_load(
+    state: &gpui::WeakEntity<State>,
+    cx: &mut AsyncApp,
+) -> Result<(), LanguageModelCompletionError> {
+    let load_task = state
+        .read_with(&*cx, |state, _| state.load_task.clone())
+        .map_err(LanguageModelCompletionError::Other)?;
+    if let Some(load_task) = load_task {
+        load_task.await.map_err(|_| {
+            LanguageModelCompletionError::Other(anyhow!(
+                "initial ChatGPT subscription credential load failed"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn account_for_credentials(credentials: &CodexCredentials) -> QuotaAccount {
+    let identity = credentials
+        .account_id
+        .as_deref()
+        .unwrap_or(&credentials.access_token);
+    QuotaAccount::from_stable_identity(PROVIDER_ID.0.as_ref(), identity.as_bytes(), None)
+}
+
+fn quota_error(error: LanguageModelCompletionError) -> QuotaError {
+    match error {
+        LanguageModelCompletionError::NoApiKey { .. } => QuotaError::MissingCredentials,
+        LanguageModelCompletionError::AuthenticationError { .. }
+        | LanguageModelCompletionError::PermissionError { .. } => {
+            QuotaError::Authentication(AUTHENTICATION_ERROR.into())
+        }
+        LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+            QuotaError::RateLimited {
+                message: RATE_LIMIT_ERROR.into(),
+                retry_after: retry_after.unwrap_or_else(|| std::time::Duration::from_secs(30)),
+            }
+        }
+        _ => QuotaError::Provider(PROVIDER_ERROR.into()),
     }
 }
 
@@ -1165,15 +1329,18 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct FakeCredentialsProvider {
         storage: Mutex<Option<(String, Vec<u8>)>>,
+        load_gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     }
 
     impl FakeCredentialsProvider {
         fn new() -> Self {
             Self {
                 storage: Mutex::new(None),
+                load_gate: Mutex::new(None),
             }
         }
     }
@@ -1184,7 +1351,15 @@ mod tests {
             _url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-            Box::pin(async { Ok(self.storage.lock().clone()) })
+            let load_gate = self.load_gate.lock().take();
+            Box::pin(async move {
+                if let Some(load_gate) = load_gate {
+                    load_gate
+                        .await
+                        .map_err(|_| anyhow!("initial credential load was cancelled"))?;
+                }
+                Ok(self.storage.lock().clone())
+            })
         }
 
         fn write_credentials<'a>(
@@ -1237,6 +1412,238 @@ mod tests {
             "expires_in": 3600
         })
         .to_string()
+    }
+
+    #[test]
+    fn quota_error_maps_completion_errors_without_leaking_details() {
+        let provider = LanguageModelProviderName::new("secret-provider");
+        assert_eq!(
+            quota_error(LanguageModelCompletionError::NoApiKey {
+                provider: provider.clone(),
+            }),
+            QuotaError::MissingCredentials
+        );
+        assert_eq!(
+            quota_error(LanguageModelCompletionError::AuthenticationError {
+                provider: provider.clone(),
+                message: "secret auth response".to_string(),
+            }),
+            QuotaError::Authentication(AUTHENTICATION_ERROR.into())
+        );
+        assert_eq!(
+            quota_error(LanguageModelCompletionError::PermissionError {
+                provider: provider.clone(),
+                message: "secret permission response".to_string(),
+            }),
+            QuotaError::Authentication(AUTHENTICATION_ERROR.into())
+        );
+        assert_eq!(
+            quota_error(LanguageModelCompletionError::RateLimitExceeded {
+                provider: provider.clone(),
+                retry_after: Some(Duration::from_secs(7)),
+            }),
+            QuotaError::RateLimited {
+                message: "ChatGPT Subscription quota refresh is rate limited".into(),
+                retry_after: Duration::from_secs(7),
+            }
+        );
+        assert_eq!(
+            quota_error(LanguageModelCompletionError::RateLimitExceeded {
+                provider: provider.clone(),
+                retry_after: None,
+            }),
+            QuotaError::RateLimited {
+                message: "ChatGPT Subscription quota refresh is rate limited".into(),
+                retry_after: Duration::from_secs(30),
+            }
+        );
+
+        let mapped = quota_error(LanguageModelCompletionError::ApiInternalServerError {
+            provider,
+            message: "secret provider body".to_string(),
+        });
+        assert_eq!(
+            mapped,
+            QuotaError::Provider("ChatGPT Subscription quota provider error".into())
+        );
+        assert!(!format!("{mapped:?}").contains("secret provider body"));
+    }
+
+    #[gpui::test]
+    async fn native_collector_waits_for_initial_credential_load(cx: &mut TestAppContext) {
+        let credentials = make_fresh_credentials();
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.storage.lock().replace((
+            "Bearer".to_string(),
+            serde_json::to_vec(&credentials).unwrap(),
+        ));
+        let (release_load, load_gate) = futures::channel::oneshot::channel();
+        *credentials_provider.load_gate.lock() = Some(load_gate);
+
+        let provider = cx.update(|cx| {
+            OpenAiSubscribedProvider::new(
+                FakeHttpClient::with_404_response(),
+                credentials_provider,
+                cx,
+            )
+        });
+        let collector = provider.quota_collector();
+        let target = ai_usage::QuotaTarget {
+            kind: ai_usage::QuotaTargetKind::NativeLanguageModel,
+            provider_or_agent_id: Arc::from("openai-subscribed"),
+            upstream_provider_id: None,
+            model_id: Some(Arc::from("gpt-5.5")),
+            model_name: Some("GPT-5.5".into()),
+        };
+        let resolve_task = cx.spawn(async move |cx| collector.resolve_account(target, &cx).await);
+
+        cx.run_until_parked();
+        release_load
+            .send(())
+            .expect("initial credential load should still be waiting");
+        let account = resolve_task
+            .await
+            .expect("stored credentials should resolve after initial load");
+        assert_eq!(account.credential_source.as_ref(), "openai-subscribed");
+    }
+
+    #[gpui::test]
+    async fn native_collector_reuses_refreshed_subscription_credentials(cx: &mut TestAppContext) {
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let wham_count = Arc::new(AtomicUsize::new(0));
+        let refresh_count_clone = refresh_count.clone();
+        let wham_count_clone = wham_count.clone();
+        let account_id = "fresh-account-id";
+        let access_token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "chatgpt_account_id": account_id,
+                })
+                .to_string()
+            )
+        );
+        let access_token_for_http = access_token.clone();
+
+        let http_client = FakeHttpClient::create(move |request| {
+            let refresh_count = refresh_count_clone.clone();
+            let wham_count = wham_count_clone.clone();
+            let access_token = access_token_for_http.clone();
+            async move {
+                if request.uri().path() == "/oauth/token" {
+                    refresh_count.fetch_add(1, Ordering::SeqCst);
+                    let body = serde_json::json!({
+                        "access_token": access_token,
+                        "refresh_token": "fresh_refresh",
+                        "expires_in": 3600,
+                    })
+                    .to_string();
+                    return Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(body))?);
+                }
+
+                assert_eq!(
+                    request.headers()["Authorization"],
+                    format!("Bearer {access_token}")
+                );
+                if request.uri().path().ends_with("rate-limit-reset-credits") {
+                    assert_eq!(request.headers()["ChatGPT-Account-ID"], account_id);
+                    return Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from("{}"))?);
+                }
+
+                assert_eq!(request.headers()["ChatGPT-Account-Id"], account_id);
+                wham_count.fetch_add(1, Ordering::SeqCst);
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(
+                        r#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}"#,
+                    ))?)
+            }
+        });
+
+        let state = cx.new(|_cx| State {
+            credentials: Some(make_expired_credentials()),
+            sign_in_task: None,
+            refresh_task: None,
+            load_task: None,
+            credentials_provider: Arc::new(FakeCredentialsProvider::new()),
+            auth_generation: 0,
+            last_auth_error: None,
+        });
+        let collector = Arc::new(OpenAiSubscribedQuotaCollector::new(
+            state.downgrade(),
+            http_client.clone(),
+        ));
+        let target = ai_usage::QuotaTarget {
+            kind: ai_usage::QuotaTargetKind::NativeLanguageModel,
+            provider_or_agent_id: Arc::from("openai-subscribed"),
+            upstream_provider_id: None,
+            model_id: Some(Arc::from("gpt-5.5")),
+            model_name: Some("GPT-5.5".into()),
+        };
+
+        let account = {
+            let collector = collector.clone();
+            let target = target.clone();
+            cx.spawn(async move |cx| collector.resolve_account(target, &cx).await)
+                .await
+                .expect("expired credentials should refresh")
+        };
+        let snapshot = {
+            let collector = collector.clone();
+            let account = account.clone();
+            let target = target.clone();
+            let http_client = http_client.clone();
+            cx.spawn(async move |cx| {
+                collector
+                    .fetch(
+                        target,
+                        account,
+                        ai_usage::QuotaFetchContext { http_client },
+                        &cx,
+                    )
+                    .await
+            })
+            .await
+            .expect("WHAM quota fetch should succeed")
+        };
+
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+        assert_eq!(wham_count.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.provider_id.as_ref(), "openai-subscribed");
+    }
+
+    #[gpui::test]
+    fn both_collectors_declare_account_wide_discovery_targets(cx: &mut TestAppContext) {
+        let state = cx.new(|_cx| State {
+            credentials: None,
+            sign_in_task: None,
+            refresh_task: None,
+            load_task: None,
+            credentials_provider: Arc::new(FakeCredentialsProvider::new()),
+            auth_generation: 0,
+            last_auth_error: None,
+        });
+        let collector = OpenAiSubscribedQuotaCollector::new(
+            state.downgrade(),
+            FakeHttpClient::with_404_response(),
+        );
+        let target = collector
+            .discovery_target()
+            .expect("native collector should advertise discovery");
+        assert_eq!(target.kind, ai_usage::QuotaTargetKind::NativeLanguageModel);
+        assert_eq!(target.provider_or_agent_id.as_ref(), "openai-subscribed");
+        assert_eq!(target.model_id, None);
+        assert_eq!(
+            collector.cache_scope(
+                &target,
+                &QuotaAccount::from_stable_identity("openai-subscribed", b"account", None),
+            ),
+            ai_usage::QuotaCacheScope::Account
+        );
     }
 
     #[gpui::test]
