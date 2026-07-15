@@ -317,11 +317,13 @@ impl Render for ContextQuotaIndicator {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompactQuotaItem {
     pub(crate) window: QuotaWindow,
 }
 
+#[cfg(test)]
 pub(crate) fn compact_items(snapshot: &QuotaSnapshot) -> Vec<CompactQuotaItem> {
     let mut windows = snapshot.windows.clone();
     if let Some(active_model_id) = snapshot.active_model_id.as_ref()
@@ -395,6 +397,7 @@ pub(crate) fn absolute_time(unix_ms: i64) -> String {
         .unwrap_or_else(|| "Unknown time".to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn render_tooltip_text(snapshot: &QuotaSnapshot, now_unix_ms: i64) -> String {
     let mut lines = vec![snapshot.provider_name.to_string()];
     if let Some(account) = snapshot.account.safe_label.as_ref() {
@@ -730,10 +733,7 @@ fn window_kind(window: &QuotaWindow) -> Option<RingKind> {
     }
 }
 
-fn applicable_quota_window<'a>(
-    snapshot: &'a QuotaSnapshot,
-    kind: RingKind,
-) -> Option<&'a QuotaWindow> {
+fn applicable_quota_window(snapshot: &QuotaSnapshot, kind: RingKind) -> Option<&QuotaWindow> {
     snapshot
         .applicable_windows()
         .into_iter()

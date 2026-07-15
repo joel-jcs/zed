@@ -246,7 +246,7 @@ impl QuotaPopover {
             return;
         }
 
-        self.active_target = Some(active_target.0.clone());
+        self.active_target = Some(active_target.0);
         let Some(active_target) = self.active_target.clone() else {
             return;
         };
@@ -280,7 +280,7 @@ impl QuotaPopover {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = provider_key(&row.target);
-        let expanded = self.expanded.contains(&key);
+        let expanded = row.expanded || self.expanded.contains(&key);
         let disclosure = Disclosure::new(key.clone(), expanded).on_click({
             let key = key.clone();
             let entity = cx.entity().downgrade();
@@ -533,20 +533,18 @@ enum RingSetting {
     Context,
 }
 
+#[cfg(test)]
 struct ProviderWindow {
     label: String,
 }
 
 struct ResetRow {
-    title: String,
-    expiry: Option<String>,
     text: String,
 }
 
 struct ResetModel {
     available_count: u64,
     rows: Vec<ResetRow>,
-    text: String,
 }
 
 fn provider_rows(
@@ -635,11 +633,11 @@ fn provider_subheading(
     .color(Color::Muted)
 }
 
+#[cfg(test)]
 fn provider_windows(snapshot: &QuotaSnapshot) -> Vec<ProviderWindow> {
     let mut windows = snapshot
         .windows
         .iter()
-        .cloned()
         .map(|window| ProviderWindow {
             label: window.label.to_string(),
         })
@@ -647,7 +645,7 @@ fn provider_windows(snapshot: &QuotaSnapshot) -> Vec<ProviderWindow> {
     if let Some(active_model_id) = snapshot.active_model_id.as_ref()
         && let Some(model_windows) = snapshot.model_windows.get(active_model_id)
     {
-        windows.extend(model_windows.iter().cloned().map(|window| ProviderWindow {
+        windows.extend(model_windows.iter().map(|window| ProviderWindow {
             label: window.label.to_string(),
         }));
     }
@@ -681,7 +679,6 @@ fn reset_model(summary: Option<&QuotaResetSummary>, now_unix_ms: i64) -> ResetMo
         return ResetModel {
             available_count: 0,
             rows: Vec::new(),
-            text: String::new(),
         };
     };
     let rows = summary
@@ -698,21 +695,12 @@ fn reset_model(summary: Option<&QuotaResetSummary>, now_unix_ms: i64) -> ResetMo
                 Some(expiry) => format!("{} · Expires {expiry}", reset.title),
                 None => reset.title.to_string(),
             };
-            ResetRow {
-                title: reset.title.to_string(),
-                expiry,
-                text,
-            }
+            ResetRow { text }
         })
         .collect::<Vec<_>>();
-    let text = std::iter::once(format!("{} available", summary.available_count))
-        .chain(rows.iter().map(|row| row.text.clone()))
-        .collect::<Vec<_>>()
-        .join("\n");
     ResetModel {
         available_count: summary.available_count,
         rows,
-        text,
     }
 }
 
@@ -808,6 +796,7 @@ fn render_context_usage(
     content
 }
 
+#[cfg(test)]
 pub(crate) fn render_popover_text(snapshot: &QuotaSnapshot, now_unix_ms: i64) -> String {
     format!(
         "Last updated {} · {} ago",
@@ -929,7 +918,7 @@ mod tests {
         let connected = target("connected");
         let mut views = HashMap::default();
         views.insert(connected.clone(), view(Some(snapshot_fetched_at(0)), None));
-        let rows = provider_rows(&[connected.clone()], Some(&active), &views);
+        let rows = provider_rows(std::slice::from_ref(&connected), Some(&active), &views);
 
         assert!(!rows.is_empty());
         assert!(should_render_standalone_context(Some(&active), &rows, true));
@@ -953,7 +942,7 @@ mod tests {
         views.insert(active.clone(), view(Some(snapshot_fetched_at(0)), None));
         views.insert(other.clone(), view(Some(snapshot_fetched_at(0)), None));
 
-        let rows = provider_rows(&[active.clone(), other.clone()], Some(&active), &views);
+        let rows = provider_rows(&[active.clone(), other], Some(&active), &views);
 
         assert!(!rows[1].expanded);
     }
@@ -1071,8 +1060,7 @@ mod tests {
 
         assert_eq!(model.available_count, 2);
         assert_eq!(model.rows.len(), 1);
-        assert_eq!(model.rows[0].title, "Review credits");
-        assert!(model.rows[0].expiry.is_some());
+        assert!(model.rows[0].text.starts_with("Review credits · Expires "));
         assert!(!model.rows[0].text.contains("description"));
         assert!(!model.rows[0].text.contains("id"));
 
@@ -1084,7 +1072,7 @@ mod tests {
             1_700_000_000_000,
         );
         assert!(count_only.rows.is_empty());
-        assert_eq!(count_only.text, "1 available");
+        assert_eq!(count_only.available_count, 1);
     }
 
     #[test]
@@ -1109,11 +1097,11 @@ mod tests {
             model
                 .rows
                 .iter()
-                .map(|row| row.title.as_str())
+                .map(|row| row.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["Available"]
         );
-        assert!(!model.text.contains("Use reset"));
+        assert!(!model.rows[0].text.contains("Use reset"));
     }
 
     #[test]

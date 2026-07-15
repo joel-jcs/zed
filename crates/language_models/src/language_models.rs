@@ -41,7 +41,7 @@ pub fn quota_target_for_model(
         provider_or_agent_id: Arc::from(model.provider_id().0.as_ref()),
         upstream_provider_id: Some(Arc::from(model.upstream_provider_id().0.as_ref())),
         model_id: Some(Arc::from(model.id().0.as_ref())),
-        model_name: Some(model.name().0.clone()),
+        model_name: Some(model.name().0),
     }
 }
 

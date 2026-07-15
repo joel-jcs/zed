@@ -196,7 +196,7 @@ impl QuotaCollector for OpenAiSubscribedQuotaCollector {
     }
 
     fn display_name(&self) -> SharedString {
-        PROVIDER_NAME.0.clone()
+        PROVIDER_NAME.0
     }
 
     fn supports(&self, target: &QuotaTarget) -> bool {
@@ -245,7 +245,7 @@ impl QuotaCollector for OpenAiSubscribedQuotaCollector {
                 .map(|credentials| account_for_credentials(&credentials))
                 .map_err(quota_error)
         });
-        Box::pin(async move { task.await })
+        Box::pin(task)
     }
 
     fn fetch(
@@ -277,7 +277,7 @@ impl QuotaCollector for OpenAiSubscribedQuotaCollector {
                 &target,
                 CodexQuotaSource {
                     provider_id: Arc::from(PROVIDER_ID.0.as_ref()),
-                    provider_name: PROVIDER_NAME.0.clone(),
+                    provider_name: PROVIDER_NAME.0,
                     authentication_error: AUTHENTICATION_ERROR.into(),
                 },
             )
