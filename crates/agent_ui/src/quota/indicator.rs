@@ -3,6 +3,7 @@ use std::sync::Arc;
 use acp_thread::{SessionCost, TokenUsage};
 use agent_settings::{AgentSettings, QuotaRingVisibility};
 use ai_usage::{QuotaSnapshot, QuotaView, QuotaWindow};
+use chrono::{DateTime, Utc};
 use fs::Fs;
 use gpui::{App, Context, Div, Entity, IntoElement, Render, Subscription, Window, div, px};
 use project::ProjectEntryId;
@@ -11,11 +12,7 @@ use ui::{ButtonLike, CircularProgress, Icon, PopoverMenu, PopoverMenuHandle, pre
 use util::ResultExt as _;
 use workspace::Workspace;
 
-use super::{
-    ActiveQuotaTarget,
-    button::{current_unix_ms, relative_age},
-    popover::QuotaPopover,
-};
+use super::{ActiveQuotaTarget, popover::QuotaPopover};
 
 const FIVE_HOUR_SECONDS: u64 = 18_000;
 const WEEKLY_SECONDS: u64 = 604_800;
@@ -104,6 +101,10 @@ impl ContextQuotaIndicator {
         self.context_usage.clone()
     }
 
+    pub(crate) fn active_target(&self) -> ActiveQuotaTarget {
+        self.target.clone()
+    }
+
     fn view(&self, cx: &mut Context<Self>) -> Option<QuotaView> {
         self.store
             .update(cx, |store, _cx| store.view(&self.target.0))
@@ -117,6 +118,17 @@ impl ContextQuotaIndicator {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let snapshot = view.and_then(|view| view.snapshot.as_ref());
+        if !has_visible_content(
+            snapshot,
+            RingVisibility {
+                weekly: settings.weekly,
+                five_hour: settings.five_hour,
+                context: settings.context,
+            },
+            self.context_usage.is_some(),
+        ) {
+            return div().into_any_element();
+        }
         let rings = snapshot
             .map(|snapshot| {
                 compact_rings(
@@ -155,7 +167,7 @@ impl ContextQuotaIndicator {
             })
             .hoverable_tooltip({
                 let context_usage = self.context_usage.clone();
-                let quota_lines = snapshot.map(|snapshot| quota_lines(snapshot, &rings));
+                let quota_lines = snapshot.map(quota_lines);
                 move |_window, cx| {
                     cx.new(|_cx| ContextQuotaTooltip {
                         context_usage: context_usage.clone(),
@@ -305,6 +317,113 @@ impl Render for ContextQuotaIndicator {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CompactQuotaItem {
+    pub(crate) window: QuotaWindow,
+}
+
+pub(crate) fn compact_items(snapshot: &QuotaSnapshot) -> Vec<CompactQuotaItem> {
+    let mut windows = snapshot.windows.clone();
+    if let Some(active_model_id) = snapshot.active_model_id.as_ref()
+        && let Some(model_windows) = snapshot.model_windows.get(active_model_id)
+    {
+        windows.extend(model_windows.iter().cloned());
+    }
+    for group in &snapshot.groups {
+        let applies = group.applies_to_model_ids.is_empty()
+            || snapshot
+                .active_model_id
+                .as_ref()
+                .is_some_and(|active| group.applies_to_model_ids.contains(active));
+        if applies {
+            windows.extend(group.buckets.iter().map(|bucket| bucket.window.clone()));
+        }
+    }
+
+    let mut indexed = windows.into_iter().enumerate().collect::<Vec<_>>();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        left.compact_priority
+            .unwrap_or(u16::MAX)
+            .cmp(&right.compact_priority.unwrap_or(u16::MAX))
+            .then(left_index.cmp(right_index))
+    });
+    indexed
+        .into_iter()
+        .take(3)
+        .map(|(_, window)| CompactQuotaItem { window })
+        .collect()
+}
+
+pub(crate) fn window_value(window: &QuotaWindow) -> String {
+    if let Some(remaining) = window.remaining_percent {
+        format!("{remaining:.0}% left")
+    } else if let Some(value) = &window.value_label {
+        value.to_string()
+    } else {
+        "Unavailable".to_string()
+    }
+}
+
+pub(crate) fn reset_value(window: &QuotaWindow, now_unix_ms: i64) -> Option<String> {
+    if let Some(reset_at) = window.reset_at_unix_ms {
+        return Some(format_duration(
+            (reset_at - now_unix_ms).max(0) as u64 / 1000,
+        ));
+    }
+    window.reset_after_seconds.map(format_duration)
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+pub(crate) fn relative_age(fetched_at_unix_ms: i64, now_unix_ms: i64) -> String {
+    format_duration((now_unix_ms - fetched_at_unix_ms).max(0) as u64 / 1000)
+}
+
+pub(crate) fn absolute_time(unix_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(unix_ms)
+        .map(|time| time.format("%-I:%M %p").to_string())
+        .unwrap_or_else(|| "Unknown time".to_string())
+}
+
+pub(crate) fn render_tooltip_text(snapshot: &QuotaSnapshot, now_unix_ms: i64) -> String {
+    let mut lines = vec![snapshot.provider_name.to_string()];
+    if let Some(account) = snapshot.account.safe_label.as_ref() {
+        lines[0].push_str(&format!(" · {account}"));
+    }
+    if let Some(model) = snapshot.active_model_id.as_ref() {
+        lines[0].push_str(&format!(" · {model}"));
+    }
+    for item in compact_items(snapshot) {
+        let mut line = format!("{}   {}", item.window.label, window_value(&item.window));
+        if let Some(reset) = reset_value(&item.window, snapshot.fetched_at_unix_ms) {
+            line.push_str(&format!(" · resets in {reset}"));
+        }
+        lines.push(line);
+    }
+    lines.push(format!(
+        "Updated {} ago",
+        relative_age(snapshot.fetched_at_unix_ms, now_unix_ms)
+    ));
+    lines.join("\n")
+}
+
+pub(crate) fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 fn quota_fill(window: &QuotaWindow, display_mode: settings::QuotaDisplayMode) -> Option<f32> {
     match display_mode {
         settings::QuotaDisplayMode::Remaining => window.remaining_percent.map(|value| value as f32),
@@ -358,11 +477,11 @@ fn tone_color(tone: RingTone, cx: &App) -> gpui::Hsla {
     }
 }
 
-fn quota_lines(snapshot: &QuotaSnapshot, rings: &[RingKind]) -> Vec<String> {
-    let mut lines = rings
-        .iter()
+fn quota_lines(snapshot: &QuotaSnapshot) -> Vec<String> {
+    let mut lines = [RingKind::Weekly, RingKind::FiveHour]
+        .into_iter()
         .filter_map(|kind| {
-            let window = applicable_quota_window(snapshot, *kind)?;
+            let window = applicable_quota_window(snapshot, kind)?;
             let remaining = window.remaining_percent?;
             let used = window.used_percent.unwrap_or_else(|| 100. - remaining);
             Some(format!(
@@ -674,6 +793,17 @@ fn compact_rings(
     effective_visibility(visibility, available_rings(snapshot, context_available))
 }
 
+fn has_visible_content(
+    snapshot: Option<&QuotaSnapshot>,
+    visibility: RingVisibility,
+    context_available: bool,
+) -> bool {
+    context_available
+        || snapshot.is_some_and(|snapshot| {
+            !compact_rings(snapshot, visibility, context_available).is_empty()
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextRingLayout {
     Single,
@@ -826,6 +956,28 @@ mod tests {
                 context: true,
             }
         );
+    }
+
+    #[test]
+    fn no_context_or_quota_snapshot_has_no_indicator_content() {
+        let snapshot = snapshot(vec![quota("weekly", WEEKLY_SECONDS, 80.0)]);
+
+        assert!(!has_visible_content(None, all_visible(), false));
+        assert!(has_visible_content(Some(&snapshot), all_visible(), false));
+        assert!(has_visible_content(None, all_visible(), true));
+    }
+
+    #[test]
+    fn hover_lines_include_quota_windows_hidden_from_compact_rings() {
+        let snapshot = snapshot(vec![
+            quota("5h", FIVE_HOUR_SECONDS, 70.0),
+            quota("weekly", WEEKLY_SECONDS, 80.0),
+        ]);
+
+        let lines = quota_lines(&snapshot);
+
+        assert!(lines.iter().any(|line| line.starts_with("5h:")));
+        assert!(lines.iter().any(|line| line.starts_with("weekly:")));
     }
 
     #[test]

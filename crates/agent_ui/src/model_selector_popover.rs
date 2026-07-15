@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelSelector};
-use gpui::{Entity, FocusHandle};
+use gpui::{Entity, FocusHandle, Subscription};
 use picker::popover_menu::PickerPopoverMenu;
 use ui::{PopoverMenuHandle, Tooltip, prelude::*};
 
@@ -11,6 +11,7 @@ use crate::{ModelSelector, model_selector::acp_model_selector};
 pub struct ModelSelectorPopover {
     selector: Entity<ModelSelector>,
     menu_handle: PopoverMenuHandle<ModelSelector>,
+    _selector_subscription: Subscription,
 }
 
 impl ModelSelectorPopover {
@@ -21,10 +22,14 @@ impl ModelSelectorPopover {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let selector =
+            cx.new(move |cx| acp_model_selector(selector, focus_handle.clone(), window, cx));
+        let selector_subscription = cx.observe(&selector, |_this, _, cx| cx.notify());
+
         Self {
-            selector: cx
-                .new(move |cx| acp_model_selector(selector, focus_handle.clone(), window, cx)),
             menu_handle,
+            selector,
+            _selector_subscription: selector_subscription,
         }
     }
 

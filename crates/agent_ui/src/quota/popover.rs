@@ -22,12 +22,32 @@ use util::ResultExt as _;
 
 use super::{
     ActiveQuotaTarget,
-    button::{absolute_time, current_unix_ms, relative_age, reset_value, window_value},
-    indicator::{ContextQuotaIndicator, ContextUsageData},
+    indicator::{
+        ContextQuotaIndicator, ContextUsageData, absolute_time, current_unix_ms, relative_age,
+        reset_value, window_value,
+    },
 };
 
 const FIVE_HOUR_SECONDS: u64 = 18_000;
 const WEEKLY_SECONDS: u64 = 604_800;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmptyPopoverContent {
+    Unavailable,
+    Context,
+}
+
+fn empty_popover_content(has_context: bool) -> EmptyPopoverContent {
+    if has_context {
+        EmptyPopoverContent::Context
+    } else {
+        EmptyPopoverContent::Unavailable
+    }
+}
+
+fn active_target_changed(current: Option<&QuotaTarget>, next: &QuotaTarget) -> bool {
+    current != Some(next)
+}
 
 pub(crate) struct QuotaPopover {
     active_target: Option<QuotaTarget>,
@@ -42,24 +62,6 @@ pub(crate) struct QuotaPopover {
 }
 
 impl QuotaPopover {
-    pub(crate) fn new(
-        target: QuotaTarget,
-        store: Entity<ai_usage::QuotaStore>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_with_context(Some(ActiveQuotaTarget(target)), None, store, None, cx)
-    }
-
-    pub(crate) fn new_with_context(
-        active_target: Option<ActiveQuotaTarget>,
-        context_usage: Option<ContextUsageData>,
-        store: Entity<ai_usage::QuotaStore>,
-        fs: Option<Arc<dyn Fs>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_with_context_source(active_target, context_usage, store, fs, None, cx)
-    }
-
     pub(crate) fn new_with_context_source(
         active_target: Option<ActiveQuotaTarget>,
         context_usage: Option<ContextUsageData>,
@@ -115,6 +117,8 @@ impl Focusable for QuotaPopover {
 
 impl Render for QuotaPopover {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_context_source(cx);
+
         let mut views = HashMap::default();
         for target in &self.targets {
             if let Some(view) = self.store.update(cx, |store, _cx| store.view(target)) {
@@ -123,6 +127,11 @@ impl Render for QuotaPopover {
         }
         let rows = provider_rows(&self.targets, self.active_target.as_ref(), &views);
         let context_usage = self.current_context_usage(cx);
+        let standalone_context = should_render_standalone_context(
+            self.active_target.as_ref(),
+            &rows,
+            context_usage.is_some(),
+        );
         let any_fetching = views.values().any(|view| view.is_fetching);
         let active_snapshot = self
             .active_target
@@ -154,17 +163,42 @@ impl Render for QuotaPopover {
             .p_3()
             .gap_3()
             .child(if rows.is_empty() {
-                v_flex()
-                    .gap_1()
-                    .child(Label::new("Quota unavailable"))
-                    .child(Label::new("No connected provider has quota data.").color(Color::Muted))
-                    .into_any_element()
+                match empty_popover_content(context_usage.is_some()) {
+                    EmptyPopoverContent::Context => {
+                        if let Some(context_usage) = context_usage.as_ref() {
+                            v_flex()
+                                .gap_2()
+                                .child(render_context_usage(context_usage, cx))
+                                .into_any_element()
+                        } else {
+                            v_flex()
+                                .gap_1()
+                                .child(Label::new("Quota unavailable"))
+                                .child(
+                                    Label::new("No connected provider has quota data.")
+                                        .color(Color::Muted),
+                                )
+                                .into_any_element()
+                        }
+                    }
+                    EmptyPopoverContent::Unavailable => v_flex()
+                        .gap_1()
+                        .child(Label::new("Quota unavailable"))
+                        .child(
+                            Label::new("No connected provider has quota data.").color(Color::Muted),
+                        )
+                        .into_any_element(),
+                }
             } else {
                 v_flex()
                     .gap_2()
                     .children(rows.into_iter().map(|row| {
                         self.render_provider(row, now_unix_ms, context_usage.as_ref(), cx)
                     }))
+                    .when_some(
+                        context_usage.as_ref().filter(|_| standalone_context),
+                        |this, context_usage| this.child(render_context_usage(context_usage, cx)),
+                    )
                     .into_any_element()
             })
             .child(self.render_settings(
@@ -200,6 +234,32 @@ impl Render for QuotaPopover {
 }
 
 impl QuotaPopover {
+    fn sync_context_source(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.context_usage_source.as_ref() else {
+            return;
+        };
+        let Ok(active_target) = source.read_with(cx, |indicator, _| indicator.active_target())
+        else {
+            return;
+        };
+        if !active_target_changed(self.active_target.as_ref(), &active_target.0) {
+            return;
+        }
+
+        self.active_target = Some(active_target.0.clone());
+        let Some(active_target) = self.active_target.clone() else {
+            return;
+        };
+        self.targets = self.store.update(cx, |store, cx| {
+            let targets = store.targets_for_popover(Some(&active_target));
+            for target in &targets {
+                store.refresh(target.clone(), false, cx);
+            }
+            targets
+        });
+        self.expanded.insert(provider_key(&active_target));
+    }
+
     fn current_context_usage(&self, cx: &App) -> Option<ContextUsageData> {
         self.context_usage_source
             .as_ref()
@@ -454,6 +514,16 @@ struct ProviderRow {
     target: QuotaTarget,
     view: QuotaView,
     expanded: bool,
+}
+
+fn should_render_standalone_context(
+    active_target: Option<&QuotaTarget>,
+    rows: &[ProviderRow],
+    context_available: bool,
+) -> bool {
+    context_available
+        && active_target
+            .is_some_and(|active_target| !rows.iter().any(|row| row.target == *active_target))
 }
 
 #[derive(Clone, Copy)]
@@ -777,7 +847,7 @@ mod tests {
     #[test]
     fn tooltip_and_popover_show_last_updated_without_lifecycle_labels() {
         let snapshot = snapshot_fetched_at(1_700_000_000_000);
-        let tooltip = super::super::button::render_tooltip_text(&snapshot, 1_700_000_018_000);
+        let tooltip = super::super::indicator::render_tooltip_text(&snapshot, 1_700_000_018_000);
         let popover = render_popover_text(&snapshot, 1_700_000_018_000);
 
         assert!(tooltip.contains("Updated 18s ago"));
@@ -832,6 +902,47 @@ mod tests {
         );
         assert!(rows[0].expanded);
         assert_ne!(provider_key(&active), provider_key(&other));
+    }
+
+    #[test]
+    fn active_target_change_rebuilds_popover_targets() {
+        let first = target_with_model("provider", "first");
+        let second = target_with_model("provider", "second");
+
+        assert!(active_target_changed(Some(&first), &second));
+        assert!(!active_target_changed(Some(&first), &first));
+        assert!(active_target_changed(None, &second));
+    }
+
+    #[test]
+    fn empty_popover_preserves_context_content() {
+        assert_eq!(
+            empty_popover_content(false),
+            EmptyPopoverContent::Unavailable
+        );
+        assert_eq!(empty_popover_content(true), EmptyPopoverContent::Context);
+    }
+
+    #[test]
+    fn context_renders_standalone_when_active_target_has_no_provider_row() {
+        let active = target("api");
+        let connected = target("connected");
+        let mut views = HashMap::default();
+        views.insert(connected.clone(), view(Some(snapshot_fetched_at(0)), None));
+        let rows = provider_rows(&[connected.clone()], Some(&active), &views);
+
+        assert!(!rows.is_empty());
+        assert!(should_render_standalone_context(Some(&active), &rows, true));
+        assert!(!should_render_standalone_context(
+            Some(&connected),
+            &rows,
+            true
+        ));
+        assert!(!should_render_standalone_context(
+            Some(&active),
+            &rows,
+            false
+        ));
     }
 
     #[test]

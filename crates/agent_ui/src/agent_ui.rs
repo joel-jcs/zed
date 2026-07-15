@@ -24,6 +24,7 @@ mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+mod quota;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -586,6 +587,7 @@ pub fn init(
     is_eval: bool,
     cx: &mut App,
 ) {
+    agent_servers::register_quota_collectors(fs.clone(), cx);
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
 
@@ -613,6 +615,9 @@ pub fn init(
         // we're not running inside of the eval.
         init_language_model_settings(cx);
     }
+    sync_quota_refresh_policy(cx);
+    cx.observe_global::<SettingsStore>(sync_quota_refresh_policy)
+        .detach();
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
@@ -900,6 +905,20 @@ fn init_language_model_settings(cx: &mut App) {
     .detach();
 }
 
+fn sync_quota_refresh_policy(cx: &mut App) {
+    let Some(store) = ai_usage::try_store(cx) else {
+        return;
+    };
+    let quota = AgentSettings::get_global(cx).quota.clone();
+    let policy = ai_usage::QuotaRefreshPolicy {
+        auto_refresh: quota.auto_refresh,
+        interval: quota.refresh_interval,
+    };
+    store.update(cx, |store, cx| {
+        store.set_refresh_policy(policy, cx);
+    });
+}
+
 fn update_active_language_model_from_settings(cx: &mut App) {
     let settings = AgentSettings::get_global(cx);
 
@@ -998,6 +1017,7 @@ mod tests {
                 enabled: false,
                 threshold: agent_settings::AutoCompactThreshold::DEFAULT,
             },
+            quota: agent_settings::AgentQuotaSettings::default(),
             enable_feedback: false,
             expand_edit_card: true,
             expand_terminal_card: true,

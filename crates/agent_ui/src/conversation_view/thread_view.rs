@@ -16,7 +16,6 @@ use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
     SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
 };
-use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
@@ -24,6 +23,7 @@ use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand};
 use crate::message_editor::SharedSessionCapabilities;
+use crate::quota::{ActiveQuotaTarget, ContextQuotaIndicator, ContextUsageData};
 use crate::ui::{SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip};
 use crate::unicode_confusables;
 
@@ -577,6 +577,7 @@ pub struct ThreadView {
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
+    pub(crate) context_quota_indicator: Option<Entity<ContextQuotaIndicator>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
@@ -894,6 +895,16 @@ impl ThreadView {
             Self::handle_message_editor_event,
         ));
 
+        subscriptions.push(cx.subscribe_in(
+            &thread,
+            window,
+            |this, _thread, event: &acp_thread::AcpThreadEvent, _window, cx| {
+                if should_sync_context_quota(event) {
+                    this.sync_context_quota_target(cx);
+                }
+            },
+        ));
+
         // If this thread is backed by a NativeAgent, listen for skill loading
         // issues so we can surface them as banners. The agent emits a single
         // replacement-style event per project refresh, so we overwrite our
@@ -939,6 +950,7 @@ impl ThreadView {
                         if matches!(this.thread_error, Some(ThreadError::NoModelSelected)) {
                             this.clear_thread_error(cx);
                         }
+                        this.sync_context_quota_target(cx);
                     },
                 ));
             }
@@ -986,6 +998,7 @@ impl ThreadView {
             mode_selector,
             model_selector,
             profile_selector,
+            context_quota_indicator: None,
             list_state,
             session_capabilities,
             resumed_without_history,
@@ -1039,6 +1052,23 @@ impl ThreadView {
             thread_search_bar: None,
             thread_search_visible: false,
         };
+
+        if let Some(model_selector) = this.model_selector.clone() {
+            this._subscriptions
+                .push(cx.observe(&model_selector, |this, _, cx| {
+                    this.sync_context_quota_target(cx);
+                }));
+        }
+        this._subscriptions.push(cx.on_release(|this, cx| {
+            if let Some(indicator) = this.context_quota_indicator.take() {
+                indicator.update(cx, |indicator, cx| indicator.release(cx));
+            }
+        }));
+        this._subscriptions
+            .push(cx.observe(&this.thread, |this, _, cx| {
+                this.sync_context_quota_target(cx);
+            }));
+        this.sync_context_quota_target(cx);
 
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
@@ -1207,6 +1237,106 @@ impl ThreadView {
         let selector = self.model_selector.as_ref()?;
         let model = selector.read(cx).active_model(cx)?;
         Some(model.id.to_string())
+    }
+
+    fn active_quota_target(&self, cx: &App) -> Option<ActiveQuotaTarget> {
+        if let Some(thread) = self.as_native_thread(cx) {
+            return thread
+                .read(cx)
+                .model()
+                .cloned()
+                .map(ActiveQuotaTarget::from_language_model);
+        }
+
+        let model_selector = self
+            .model_selector
+            .as_ref()
+            .map(|model_selector| model_selector.read(cx));
+        Some(ActiveQuotaTarget::from_external(
+            &self.agent_id,
+            None,
+            model_selector,
+            cx,
+        ))
+    }
+
+    fn context_usage_data(&self, cx: &mut App) -> Option<ContextUsageData> {
+        let thread = self.thread.read(cx);
+        let mut token_usage = thread.token_usage()?.clone();
+        let model = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).model().cloned());
+        token_usage.max_output_tokens = token_usage
+            .max_output_tokens
+            .or_else(|| model.as_ref().and_then(|model| model.max_output_tokens()));
+
+        let show_split = model
+            .as_ref()
+            .is_some_and(|model| model.supports_split_token_display());
+        let (project_rules_count, project_entry_ids) = self
+            .as_native_thread(cx)
+            .map(|thread| {
+                let project_context = thread.read(cx).project_context().read(cx);
+                let project_entry_ids = project_context
+                    .worktrees
+                    .iter()
+                    .filter_map(|worktree| worktree.rules_file.as_ref())
+                    .map(|rules_file| ProjectEntryId::from_usize(rules_file.project_entry_id))
+                    .collect::<Vec<_>>();
+                let project_rules_count = project_entry_ids.len();
+                (project_rules_count, project_entry_ids)
+            })
+            .unwrap_or_default();
+
+        Some(ContextUsageData {
+            token_usage,
+            show_split,
+            cost: thread.cost().cloned(),
+            global_agents_md_loaded: agent_settings::UserAgentsMd::global(cx)
+                .and_then(|agents_md| agents_md.content())
+                .is_some(),
+            project_rules_count,
+            project_entry_ids,
+            workspace: self.workspace.clone(),
+        })
+    }
+
+    fn sync_context_quota_target(&mut self, cx: &mut Context<Self>) {
+        let target = self.active_quota_target(cx);
+        let context_usage = self.context_usage_data(cx);
+        let has_quota_collector = target
+            .as_ref()
+            .is_some_and(|target| ai_usage::collector_for(&target.0, cx).is_some());
+        if !should_create_context_quota_indicator(context_usage.is_some(), has_quota_collector) {
+            if let Some(indicator) = self.context_quota_indicator.take() {
+                indicator.update(cx, |indicator, cx| indicator.release(cx));
+            }
+            return;
+        }
+        match (&self.context_quota_indicator, target) {
+            (Some(indicator), Some(target)) => {
+                indicator.update(cx, |indicator, cx| {
+                    indicator.set_target(target, cx);
+                    indicator.set_context_usage(context_usage, cx);
+                });
+            }
+            (None, Some(target)) => {
+                let Some(store) = ai_usage::store(cx) else {
+                    return;
+                };
+                let fs = self.thread.read(cx).project().read(cx).fs().clone();
+                let indicator = cx.new(|cx| ContextQuotaIndicator::new(target, store, fs, cx));
+                indicator.update(cx, |indicator, cx| {
+                    indicator.set_context_usage(context_usage, cx);
+                });
+                self.context_quota_indicator = Some(indicator);
+            }
+            (Some(indicator), None) => {
+                indicator.update(cx, |indicator, cx| indicator.release(cx));
+                self.context_quota_indicator = None;
+            }
+            (None, None) => {}
+        }
     }
 
     pub fn current_mode_id(&self, cx: &App) -> Option<Arc<str>> {
@@ -4361,7 +4491,7 @@ impl ThreadView {
                                 h_flex()
                                     .flex_wrap()
                                     .gap_1()
-                                    .children(self.render_token_usage(cx))
+                                    .children(self.context_quota_indicator.clone())
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
@@ -4591,198 +4721,6 @@ impl ThreadView {
                     })
             }))
             .into_any_element()
-    }
-
-    fn supports_split_token_display(&self, cx: &App) -> bool {
-        self.as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).model())
-            .is_some_and(|model| model.supports_split_token_display())
-    }
-
-    fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let thread = self.thread.read(cx);
-        let usage = thread.token_usage()?;
-        let show_split = self.supports_split_token_display(cx);
-
-        let cost_label = thread.cost().map(|cost| {
-            let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
-                4
-            } else {
-                2
-            };
-            format!("{:.prec$} {}", cost.amount, cost.currency, prec = precision)
-        });
-
-        let progress_color = |ratio: f32| -> Hsla {
-            if ratio >= 0.85 {
-                cx.theme().status().warning
-            } else {
-                cx.theme().colors().text_muted
-            }
-        };
-
-        let used = crate::humanize_token_count(usage.used_tokens);
-        let max = crate::humanize_token_count(usage.max_tokens);
-        let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
-        let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
-
-        let progress_ratio = if usage.max_tokens > 0 {
-            usage.used_tokens as f32 / usage.max_tokens as f32
-        } else {
-            0.0
-        };
-
-        let ring_size = px(16.0);
-        let stroke_width = px(2.);
-
-        let percentage = format!("{}%", (progress_ratio * 100.0).round() as u32);
-
-        let tooltip_separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
-
-        let (project_rules_count, project_entry_ids) = self
-            .as_native_thread(cx)
-            .map(|thread| {
-                let project_context = thread.read(cx).project_context().read(cx);
-                let project_entry_ids = project_context
-                    .worktrees
-                    .iter()
-                    .filter_map(|wt| wt.rules_file.as_ref())
-                    .map(|rf| ProjectEntryId::from_usize(rf.project_entry_id))
-                    .collect::<Vec<_>>();
-                let project_rules_count = project_entry_ids.len();
-                (project_rules_count, project_entry_ids)
-            })
-            .unwrap_or_default();
-
-        let global_agents_md_loaded = UserAgentsMd::global(cx)
-            .and_then(|md| md.content())
-            .is_some();
-
-        let workspace = self.workspace.clone();
-
-        let max_output_tokens = self
-            .as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).model())
-            .and_then(|model| model.max_output_tokens())
-            .unwrap_or(0);
-        let input_max_label =
-            crate::humanize_token_count(usage.max_tokens.saturating_sub(max_output_tokens));
-        let output_max_label = crate::humanize_token_count(max_output_tokens);
-
-        let build_tooltip = {
-            move |_window: &mut Window, cx: &mut App| {
-                let percentage = percentage.clone();
-                let used = used.clone();
-                let max = max.clone();
-                let input_tokens_label = input_tokens_label.clone();
-                let output_tokens_label = output_tokens_label.clone();
-                let input_max_label = input_max_label.clone();
-                let output_max_label = output_max_label.clone();
-                let project_entry_ids = project_entry_ids.clone();
-                let workspace = workspace.clone();
-                let cost_label = cost_label.clone();
-                cx.new(move |_cx| TokenUsageTooltip {
-                    percentage,
-                    used,
-                    max,
-                    input_tokens: input_tokens_label,
-                    output_tokens: output_tokens_label,
-                    input_max: input_max_label,
-                    output_max: output_max_label,
-                    show_split,
-                    cost_label,
-                    separator_color: tooltip_separator_color,
-                    global_agents_md_loaded,
-                    project_rules_count,
-                    project_entry_ids,
-                    workspace,
-                })
-                .into()
-            }
-        };
-
-        if show_split {
-            let input_max_raw = usage.max_tokens.saturating_sub(max_output_tokens);
-            let output_max_raw = max_output_tokens;
-
-            let input_ratio = if input_max_raw > 0 {
-                usage.input_tokens as f32 / input_max_raw as f32
-            } else {
-                0.0
-            };
-            let output_ratio = if output_max_raw > 0 {
-                usage.output_tokens as f32 / output_max_raw as f32
-            } else {
-                0.0
-            };
-
-            Some(
-                h_flex()
-                    .id("split_token_usage")
-                    .flex_shrink_0()
-                    .gap_1p5()
-                    .mr_1()
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                Icon::new(IconName::ArrowUp)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                CircularProgress::new(
-                                    usage.input_tokens as f32,
-                                    input_max_raw as f32,
-                                    ring_size,
-                                    cx,
-                                )
-                                .stroke_width(stroke_width)
-                                .progress_color(progress_color(input_ratio)),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                Icon::new(IconName::ArrowDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                CircularProgress::new(
-                                    usage.output_tokens as f32,
-                                    output_max_raw as f32,
-                                    ring_size,
-                                    cx,
-                                )
-                                .stroke_width(stroke_width)
-                                .progress_color(progress_color(output_ratio)),
-                            ),
-                    )
-                    .hoverable_tooltip(build_tooltip)
-                    .into_any_element(),
-            )
-        } else {
-            Some(
-                h_flex()
-                    .id("circular_progress_tokens")
-                    .mt_px()
-                    .mr_1()
-                    .child(
-                        CircularProgress::new(
-                            usage.used_tokens as f32,
-                            usage.max_tokens as f32,
-                            ring_size,
-                            cx,
-                        )
-                        .stroke_width(stroke_width)
-                        .progress_color(progress_color(progress_ratio)),
-                    )
-                    .hoverable_tooltip(build_tooltip)
-                    .into_any_element(),
-            )
-        }
     }
 
     fn fast_mode_available(&self, cx: &Context<Self>) -> bool {
@@ -5626,195 +5564,15 @@ impl ThreadView {
     }
 }
 
-struct TokenUsageTooltip {
-    percentage: String,
-    used: String,
-    max: String,
-    input_tokens: String,
-    output_tokens: String,
-    input_max: String,
-    output_max: String,
-    show_split: bool,
-    cost_label: Option<String>,
-    separator_color: Color,
-    global_agents_md_loaded: bool,
-    project_rules_count: usize,
-    project_entry_ids: Vec<ProjectEntryId>,
-    workspace: WeakEntity<Workspace>,
+fn should_sync_context_quota(event: &acp_thread::AcpThreadEvent) -> bool {
+    matches!(event, acp_thread::AcpThreadEvent::TokenUsageUpdated)
 }
 
-impl Render for TokenUsageTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let separator_color = self.separator_color;
-        let percentage = self.percentage.clone();
-        let used = self.used.clone();
-        let max = self.max.clone();
-        let input_tokens = self.input_tokens.clone();
-        let output_tokens = self.output_tokens.clone();
-        let input_max = self.input_max.clone();
-        let output_max = self.output_max.clone();
-        let show_split = self.show_split;
-        let cost_label = self.cost_label.clone();
-        let global_agents_md_loaded = self.global_agents_md_loaded;
-        let project_rules_count = self.project_rules_count;
-        let project_entry_ids = self.project_entry_ids.clone();
-        let workspace = self.workspace.clone();
-
-        ui::tooltip_container(cx, move |container, cx| {
-            container
-                .min_w_40()
-                .child(
-                    Label::new("Context")
-                        .color(Color::Muted)
-                        .size(LabelSize::Small),
-                )
-                .when(!show_split, |this| {
-                    this.child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(Label::new(percentage.clone()))
-                            .child(Label::new("\u{2022}").color(separator_color).mx_1())
-                            .child(Label::new(used.clone()))
-                            .child(Label::new("/").color(separator_color))
-                            .child(Label::new(max.clone()).color(Color::Muted)),
-                    )
-                })
-                .when(show_split, |this| {
-                    this.child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .child(Label::new("Input:").color(Color::Muted).mr_0p5())
-                                    .child(Label::new(input_tokens))
-                                    .child(Label::new("/").color(separator_color))
-                                    .child(Label::new(input_max).color(Color::Muted)),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .child(Label::new("Output:").color(Color::Muted).mr_0p5())
-                                    .child(Label::new(output_tokens))
-                                    .child(Label::new("/").color(separator_color))
-                                    .child(Label::new(output_max).color(Color::Muted)),
-                            ),
-                    )
-                })
-                .when_some(cost_label, |this, cost_label| {
-                    this.child(
-                        v_flex()
-                            .mt_1p5()
-                            .pt_1p5()
-                            .gap_0p5()
-                            .border_t_1()
-                            .border_color(cx.theme().colors().border_variant)
-                            .child(
-                                Label::new("Cost")
-                                    .color(Color::Muted)
-                                    .size(LabelSize::Small),
-                            )
-                            .child(Label::new(cost_label)),
-                    )
-                })
-                .when(
-                    global_agents_md_loaded || project_rules_count > 0,
-                    move |this| {
-                        this.child(
-                            v_flex()
-                                .mt_1p5()
-                                .pt_1p5()
-                                .pb_0p5()
-                                .gap_0p5()
-                                .border_t_1()
-                                .border_color(cx.theme().colors().border_variant)
-                                .child(
-                                    Label::new("Rules")
-                                        .color(Color::Muted)
-                                        .size(LabelSize::Small),
-                                )
-                                .child(
-                                    v_flex()
-                                        .mx_neg_1()
-                                        .when(global_agents_md_loaded, {
-                                            let workspace = workspace.clone();
-                                            move |this| {
-                                                this.child(
-                                                    Button::new(
-                                                        "open-global-agents-md",
-                                                        "1 global rule",
-                                                    )
-                                                    .end_icon(
-                                                        Icon::new(IconName::ArrowUpRight)
-                                                            .color(Color::Muted)
-                                                            .size(IconSize::XSmall),
-                                                    )
-                                                    .on_click(move |_, window, cx| {
-                                                        workspace
-                                                            .update(cx, |workspace, cx| {
-                                                                workspace
-                                                                    .open_abs_path(
-                                                                        paths::agents_file()
-                                                                            .clone(),
-                                                                        workspace::OpenOptions {
-                                                                            focus: Some(true),
-                                                                            ..Default::default()
-                                                                        },
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                    .detach_and_log_err(cx);
-                                                            })
-                                                            .log_err();
-                                                    }),
-                                                )
-                                            }
-                                        })
-                                        .when(project_rules_count > 0, move |this| {
-                                            let workspace = workspace.clone();
-                                            let project_entry_ids = project_entry_ids.clone();
-                                            this.child(
-                                                Button::new(
-                                                    "open-project-rules",
-                                                    format!(
-                                                        "{} project rules",
-                                                        project_rules_count
-                                                    ),
-                                                )
-                                                .end_icon(
-                                                    Icon::new(IconName::ArrowUpRight)
-                                                        .color(Color::Muted)
-                                                        .size(IconSize::XSmall),
-                                                )
-                                                .on_click(move |_, window, cx| {
-                                                    let _ =
-                                                        workspace.update(cx, |workspace, cx| {
-                                                            let project =
-                                                                workspace.project().read(cx);
-                                                            let paths = project_entry_ids
-                                                                .iter()
-                                                                .flat_map(|id| {
-                                                                    project.path_for_entry(*id, cx)
-                                                                })
-                                                                .collect::<Vec<_>>();
-                                                            for path in paths {
-                                                                workspace
-                                                                    .open_path(
-                                                                        path, None, true, window,
-                                                                        cx,
-                                                                    )
-                                                                    .detach_and_log_err(cx);
-                                                            }
-                                                        });
-                                                }),
-                                            )
-                                        }),
-                                ),
-                        )
-                    },
-                )
-        })
-    }
+fn should_create_context_quota_indicator(
+    context_available: bool,
+    has_quota_collector: bool,
+) -> bool {
+    context_available || has_quota_collector
 }
 
 /// A display-ready snapshot of a sandbox policy for the status tooltip.
@@ -12504,6 +12262,23 @@ mod tests {
         );
         // No matching prefix: returns the trimmed input unchanged.
         assert_eq!(strip_leading_command("hello", "compact"), "hello");
+    }
+
+    #[test]
+    fn token_usage_events_refresh_context_quota() {
+        assert!(should_sync_context_quota(
+            &acp_thread::AcpThreadEvent::TokenUsageUpdated
+        ));
+        assert!(!should_sync_context_quota(
+            &acp_thread::AcpThreadEvent::StatusChanged
+        ));
+    }
+
+    #[test]
+    fn unsupported_target_without_context_has_no_quota_indicator() {
+        assert!(!should_create_context_quota_indicator(false, false));
+        assert!(should_create_context_quota_indicator(true, false));
+        assert!(should_create_context_quota_indicator(false, true));
     }
 
     #[gpui::test]

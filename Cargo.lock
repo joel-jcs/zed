@@ -466,6 +466,7 @@ dependencies = [
  "agent_settings",
  "agent_skills",
  "ai_onboarding",
+ "ai_usage",
  "anyhow",
  "async-channel 2.5.0",
  "audio",
