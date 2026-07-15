@@ -1,0 +1,19 @@
+{
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 30,
+      "limit_window_seconds": 604800,
+      "reset_after_seconds": 604800,
+      "reset_at": 1784654520
+    },
+    "secondary_window": null
+  },
+  "additional_rate_limits": [],
+  "credits": {
+    "has_credits": false,
+    "balance": 0,
+    "unlimited": false
+  },
+  "plan_type": "prolite",
+  "code_review_rate_limit": null
+}

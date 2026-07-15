@@ -1,0 +1,25 @@
+{
+  "available_count": 2,
+  "credits": [
+    {
+      "status": "AVAILABLE",
+      "title": "Weekly bonus",
+      "expires_at": 1784654520
+    },
+    {
+      "status": "available",
+      "title": null,
+      "expires_at": "2026-07-15T12:00:00Z"
+    },
+    {
+      "status": "redeemed",
+      "title": "Redeemed",
+      "expires_at": "2026-07-15T12:00:00Z"
+    },
+    {
+      "status": "expired",
+      "title": "Expired",
+      "expires_at": "2026-07-15T12:00:00Z"
+    }
+  ]
+}
