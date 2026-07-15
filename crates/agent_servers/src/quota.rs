@@ -64,4 +64,17 @@ mod tests {
 
         assert_eq!(target.upstream_provider_id.as_deref(), Some("anthropic"));
     }
+
+    #[test]
+    fn opencode_without_explicit_upstream_is_not_codex() {
+        let target = quota_target_for_agent(
+            &AgentId::new("opencode"),
+            None,
+            Some("gpt-5-codex"),
+            Some("Codex".into()),
+        );
+
+        assert_eq!(target.provider_or_agent_id.as_ref(), "opencode");
+        assert_eq!(target.upstream_provider_id, None);
+    }
 }
