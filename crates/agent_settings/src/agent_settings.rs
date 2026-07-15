@@ -201,6 +201,60 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentQuotaSettings {
+    pub display_mode: settings::QuotaDisplayMode,
+    pub visible_rings: QuotaRingVisibility,
+    pub auto_refresh: bool,
+    pub refresh_interval: std::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotaRingVisibility {
+    pub context: bool,
+    pub five_hour: bool,
+    pub weekly: bool,
+}
+
+impl Default for QuotaRingVisibility {
+    fn default() -> Self {
+        Self {
+            context: true,
+            five_hour: true,
+            weekly: true,
+        }
+    }
+}
+
+impl Default for AgentQuotaSettings {
+    fn default() -> Self {
+        Self {
+            display_mode: settings::QuotaDisplayMode::default(),
+            visible_rings: QuotaRingVisibility::default(),
+            auto_refresh: false,
+            refresh_interval: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+impl AgentQuotaSettings {
+    fn from_content(content: Option<settings::AgentQuotaSettingsContent>) -> Self {
+        let content = content.unwrap_or_default();
+        Self {
+            display_mode: content.display_mode.unwrap_or_default(),
+            visible_rings: QuotaRingVisibility {
+                context: content.show_context_ring.unwrap_or(true),
+                five_hour: content.show_five_hour_ring.unwrap_or(true),
+                weekly: content.show_weekly_ring.unwrap_or(true),
+            },
+            auto_refresh: content.auto_refresh.unwrap_or(false),
+            refresh_interval: std::time::Duration::from_secs(
+                content.refresh_interval_seconds.unwrap_or(30).max(15),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
     pub enabled: bool,
@@ -229,6 +283,7 @@ pub struct AgentSettings {
     pub single_file_review: bool,
     pub model_parameters: Vec<LanguageModelParameters>,
     pub auto_compact: AutoCompactSettings,
+    pub quota: AgentQuotaSettings,
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
@@ -794,6 +849,7 @@ impl Settings for AgentSettings {
                     threshold,
                 }
             },
+            quota: AgentQuotaSettings::from_content(agent.quota),
             enable_feedback: agent.enable_feedback.unwrap(),
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
@@ -944,6 +1000,64 @@ mod tests {
     use serde_json::json;
     use settings::ToolPermissionMode;
     use settings::ToolPermissionsContent;
+
+    #[test]
+    fn quota_ring_settings_default_to_remaining_and_all_visible() {
+        let settings = AgentQuotaSettings::default();
+        assert_eq!(settings.display_mode, settings::QuotaDisplayMode::Remaining);
+        assert_eq!(
+            settings.visible_rings,
+            QuotaRingVisibility {
+                context: true,
+                five_hour: true,
+                weekly: true,
+            }
+        );
+        assert!(!settings.auto_refresh);
+        assert_eq!(
+            settings.refresh_interval,
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn quota_ring_settings_deserialize_used_and_hidden_rings() {
+        let content: settings::AgentQuotaSettingsContent = serde_json::from_value(json!({
+            "display_mode": "used",
+            "show_context_ring": false,
+            "show_five_hour_ring": true,
+            "show_weekly_ring": false,
+        }))
+        .expect("quota settings should deserialize");
+        let settings = AgentQuotaSettings::from_content(Some(content));
+
+        assert_eq!(settings.display_mode, settings::QuotaDisplayMode::Used);
+        assert_eq!(
+            settings.visible_rings,
+            QuotaRingVisibility {
+                context: false,
+                five_hour: true,
+                weekly: false,
+            }
+        );
+    }
+
+    #[test]
+    fn quota_refresh_interval_is_clamped_to_fifteen_seconds() {
+        let settings =
+            AgentQuotaSettings::from_content(Some(settings::AgentQuotaSettingsContent {
+                auto_refresh: Some(true),
+                refresh_interval_seconds: Some(5),
+                display_mode: Some(settings::QuotaDisplayMode::Remaining),
+                show_context_ring: Some(true),
+                show_five_hour_ring: Some(true),
+                show_weekly_ring: Some(true),
+            }));
+        assert_eq!(
+            settings.refresh_interval,
+            std::time::Duration::from_secs(15)
+        );
+    }
 
     #[test]
     fn test_parse_auto_compact_threshold() {

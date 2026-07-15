@@ -1147,6 +1147,14 @@
       // 0 is not a valid threshold.
       "threshold": "90%",
     },
+    "quota": {
+      "display_mode": "remaining",
+      "show_context_ring": true,
+      "show_five_hour_ring": true,
+      "show_weekly_ring": true,
+      "auto_refresh": false,
+      "refresh_interval_seconds": 30,
+    },
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,
     "default_profile": "write",
