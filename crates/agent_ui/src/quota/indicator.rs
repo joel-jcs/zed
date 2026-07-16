@@ -167,7 +167,9 @@ impl ContextQuotaIndicator {
             })
             .hoverable_tooltip({
                 let context_usage = self.context_usage.clone();
-                let quota_lines = snapshot.map(quota_lines);
+                let active_target = self.target.0.clone();
+                let quota_lines =
+                    snapshot.map(|s| quota_lines(s, Some(&active_target), current_unix_ms()));
                 move |_window, cx| {
                     cx.new(|_cx| ContextQuotaTooltip {
                         context_usage: context_usage.clone(),
@@ -317,43 +319,28 @@ impl Render for ContextQuotaIndicator {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CompactQuotaItem {
-    pub(crate) window: QuotaWindow,
-}
-
-#[cfg(test)]
-pub(crate) fn compact_items(snapshot: &QuotaSnapshot) -> Vec<CompactQuotaItem> {
+pub(crate) fn all_items(snapshot: &QuotaSnapshot) -> Vec<QuotaWindow> {
     let mut windows = snapshot.windows.clone();
+
     if let Some(active_model_id) = snapshot.active_model_id.as_ref()
         && let Some(model_windows) = snapshot.model_windows.get(active_model_id)
     {
         windows.extend(model_windows.iter().cloned());
     }
+
     for group in &snapshot.groups {
         let applies = group.applies_to_model_ids.is_empty()
             || snapshot
                 .active_model_id
                 .as_ref()
                 .is_some_and(|active| group.applies_to_model_ids.contains(active));
+
         if applies {
             windows.extend(group.buckets.iter().map(|bucket| bucket.window.clone()));
         }
     }
 
-    let mut indexed = windows.into_iter().enumerate().collect::<Vec<_>>();
-    indexed.sort_by(|(left_index, left), (right_index, right)| {
-        left.compact_priority
-            .unwrap_or(u16::MAX)
-            .cmp(&right.compact_priority.unwrap_or(u16::MAX))
-            .then(left_index.cmp(right_index))
-    });
-    indexed
-        .into_iter()
-        .take(3)
-        .map(|(_, window)| CompactQuotaItem { window })
-        .collect()
+    windows
 }
 
 pub(crate) fn window_value(window: &QuotaWindow) -> String {
@@ -398,26 +385,12 @@ pub(crate) fn absolute_time(unix_ms: i64) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn render_tooltip_text(snapshot: &QuotaSnapshot, now_unix_ms: i64) -> String {
-    let mut lines = vec![snapshot.provider_name.to_string()];
-    if let Some(account) = snapshot.account.safe_label.as_ref() {
-        lines[0].push_str(&format!(" · {account}"));
-    }
-    if let Some(model) = snapshot.active_model_id.as_ref() {
-        lines[0].push_str(&format!(" · {model}"));
-    }
-    for item in compact_items(snapshot) {
-        let mut line = format!("{}   {}", item.window.label, window_value(&item.window));
-        if let Some(reset) = reset_value(&item.window, snapshot.fetched_at_unix_ms) {
-            line.push_str(&format!(" · resets in {reset}"));
-        }
-        lines.push(line);
-    }
-    lines.push(format!(
-        "Updated {} ago",
-        relative_age(snapshot.fetched_at_unix_ms, now_unix_ms)
-    ));
-    lines.join("\n")
+pub(crate) fn render_tooltip_text(
+    snapshot: &QuotaSnapshot,
+    target: Option<&ai_usage::QuotaTarget>,
+    now_unix_ms: i64,
+) -> String {
+    quota_lines(snapshot, target, now_unix_ms).join("\n")
 }
 
 pub(crate) fn current_unix_ms() -> i64 {
@@ -480,22 +453,37 @@ fn tone_color(tone: RingTone, cx: &App) -> gpui::Hsla {
     }
 }
 
-fn quota_lines(snapshot: &QuotaSnapshot) -> Vec<String> {
-    let mut lines = [RingKind::Weekly, RingKind::FiveHour]
-        .into_iter()
-        .filter_map(|kind| {
-            let window = applicable_quota_window(snapshot, kind)?;
-            let remaining = window.remaining_percent?;
-            let used = window.used_percent.unwrap_or_else(|| 100. - remaining);
-            Some(format!(
-                "{}: {:.0}% remaining · {:.0}% used",
-                window.label, remaining, used
-            ))
-        })
-        .collect::<Vec<_>>();
+fn quota_lines(
+    snapshot: &QuotaSnapshot,
+    target: Option<&ai_usage::QuotaTarget>,
+    now_unix_ms: i64,
+) -> Vec<String> {
+    let mut lines = vec![snapshot.provider_name.to_string()];
+    let account = snapshot
+        .account
+        .safe_label
+        .as_deref()
+        .unwrap_or(snapshot.account.fingerprint.as_ref());
+    lines[0].push_str(&format!(" · {account}"));
+
+    let model = target
+        .and_then(|target| target.model_name.as_deref())
+        .or_else(|| snapshot.active_model_id.as_deref());
+    if let Some(model) = model {
+        lines[0].push_str(&format!(" · {model}"));
+    }
+    for window in all_items(snapshot) {
+        let mut line = format!("{}: {}", window.label, window_value(&window));
+
+        if let Some(reset) = reset_value(&window, now_unix_ms) {
+            line.push_str(&format!(" · resets in {reset}"));
+        }
+
+        lines.push(line);
+    }
     lines.push(format!(
-        "Last quota success: {} ago",
-        relative_age(snapshot.fetched_at_unix_ms, current_unix_ms())
+        "Updated {} ago",
+        relative_age(snapshot.fetched_at_unix_ms, now_unix_ms)
     ));
     lines
 }
@@ -830,17 +818,23 @@ mod tests {
             provider_id: Arc::from("provider"),
             provider_name: "Provider".into(),
             account: QuotaAccountSummary {
-                fingerprint: Arc::from("account"),
-                safe_label: None,
+                fingerprint: Arc::from("account-fingerprint"),
+                safe_label: Some("account".into()),
             },
             plan: None,
-            fetched_at_unix_ms: 0,
-            active_model_id: Some(Arc::from("active")),
+            fetched_at_unix_ms: 1_700_000_000_000,
+            active_model_id: None,
             windows,
             model_windows: HashMap::default(),
             groups: Vec::new(),
             available_resets: None,
         }
+    }
+
+    fn snapshot_fetched_at(unix_ms: i64) -> QuotaSnapshot {
+        let mut s = snapshot(Vec::new());
+        s.fetched_at_unix_ms = unix_ms;
+        s
     }
 
     fn quota(label: &str, seconds: u64, remaining: f64) -> QuotaWindow {
@@ -974,10 +968,47 @@ mod tests {
             quota("weekly", WEEKLY_SECONDS, 80.0),
         ]);
 
-        let lines = quota_lines(&snapshot);
+        let lines = quota_lines(&snapshot, None, current_unix_ms());
 
         assert!(lines.iter().any(|line| line.starts_with("5h:")));
         assert!(lines.iter().any(|line| line.starts_with("weekly:")));
+    }
+
+    #[test]
+    fn hover_uses_safe_account_fingerprint_fallback() {
+        let mut snapshot = snapshot_fetched_at(0);
+        snapshot.account.safe_label = None;
+        snapshot.account.fingerprint = Arc::from("user_fingerprint");
+        let lines = quota_lines(&snapshot, None, 0);
+        assert!(lines[0].contains("user_fingerprint"));
+    }
+
+    #[test]
+    fn hover_uses_target_model_display_name() {
+        let mut snapshot = snapshot_fetched_at(0);
+        snapshot.active_model_id = Some(Arc::from("normalized-id"));
+        let target = ai_usage::QuotaTarget {
+            kind: ai_usage::QuotaTargetKind::ExternalAgent,
+            provider_or_agent_id: Arc::from("provider"),
+            upstream_provider_id: None,
+            model_id: None,
+            model_name: Some("Display Model".into()),
+        };
+        let lines = quota_lines(&snapshot, Some(&target), 0);
+        assert!(lines[0].contains("Display Model"));
+        assert!(!lines[0].contains("normalized-id"));
+    }
+
+    #[test]
+    fn hover_retains_rows_beyond_compact_ring_limit() {
+        let mut snapshot = snapshot_fetched_at(0);
+        for i in 0..5 {
+            snapshot
+                .windows
+                .push(quota(&format!("window {i}"), WEEKLY_SECONDS, 80.0));
+        }
+        let lines = quota_lines(&snapshot, None, 0);
+        assert!(lines.iter().any(|l| l.starts_with("window 4:")));
     }
 
     #[test]

@@ -127,11 +127,7 @@ impl Render for QuotaPopover {
         }
         let rows = provider_rows(&self.targets, self.active_target.as_ref(), &views);
         let context_usage = self.current_context_usage(cx);
-        let standalone_context = should_render_standalone_context(
-            self.active_target.as_ref(),
-            &rows,
-            context_usage.is_some(),
-        );
+        let standalone_context = should_render_standalone_context(&rows, context_usage.is_some());
         let any_fetching = views.values().any(|view| view.is_fetching);
         let active_snapshot = self
             .active_target
@@ -246,10 +242,16 @@ impl QuotaPopover {
             return;
         }
 
+        let prev_key = self.active_target.as_ref().map(provider_key);
         self.active_target = Some(active_target.0);
         let Some(active_target) = self.active_target.clone() else {
             return;
         };
+
+        if let Some(prev) = prev_key {
+            self.expanded.remove(&prev);
+        }
+
         self.targets = self.store.update(cx, |store, cx| {
             let targets = store.targets_for_popover(Some(&active_target));
             for target in &targets {
@@ -280,7 +282,7 @@ impl QuotaPopover {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = provider_key(&row.target);
-        let expanded = row.expanded || self.expanded.contains(&key);
+        let expanded = row.is_active || self.expanded.contains(&key);
         let disclosure = Disclosure::new(key.clone(), expanded).on_click({
             let key = key.clone();
             let entity = cx.entity().downgrade();
@@ -337,7 +339,14 @@ impl QuotaPopover {
             .gap_2()
             .child(header)
             .when(expanded, |this| {
-                this.child(self.render_provider_body(&row.view, now_unix_ms, context_usage, cx))
+                let body_context = if row.is_active { context_usage } else { None };
+                this.child(self.render_provider_body(
+                    &row.view,
+                    row.is_active,
+                    now_unix_ms,
+                    body_context,
+                    cx,
+                ))
             })
             .into_any_element()
     }
@@ -345,6 +354,7 @@ impl QuotaPopover {
     fn render_provider_body(
         &self,
         view: &QuotaView,
+        is_active: bool,
         now_unix_ms: i64,
         context_usage: Option<&ContextUsageData>,
         cx: &mut Context<Self>,
@@ -354,7 +364,7 @@ impl QuotaPopover {
                 .gap_1()
                 .child(Label::new("Quota unavailable"))
                 .child(Label::new("No quota data is available yet.").color(Color::Muted));
-            if let Some(error) = provider_error_text(view) {
+            if let Some(error) = provider_error_text(view, is_active) {
                 content = content.child(Label::new(error).color(Color::Muted));
             }
             return content.into_any_element();
@@ -369,21 +379,26 @@ impl QuotaPopover {
                     .child(Label::new(plan.clone())),
             );
         }
-        content = content.child(render_section("Quota", &snapshot.windows, now_unix_ms));
+        if !snapshot.windows.is_empty() {
+            content = content.child(render_section("Quota", &snapshot.windows, now_unix_ms));
+        }
         if let Some(active_model_id) = snapshot.active_model_id.as_ref()
             && let Some(windows) = snapshot.model_windows.get(active_model_id)
+            && !windows.is_empty()
         {
             content = content.child(render_section("Active model", windows, now_unix_ms));
         }
         for group in &snapshot.groups {
-            let windows = group
-                .buckets
-                .iter()
-                .map(|bucket| bucket.window.clone())
-                .collect::<Vec<_>>();
-            content = content.child(render_section(&group.display_name, &windows, now_unix_ms));
+            if !group.buckets.is_empty() {
+                let windows = group
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.window.clone())
+                    .collect::<Vec<_>>();
+                content = content.child(render_section(&group.display_name, &windows, now_unix_ms));
+            }
         }
-        if let Some(error) = provider_error_text(view) {
+        if let Some(error) = provider_error_text(view, is_active) {
             content = content.child(
                 v_flex()
                     .gap_1()
@@ -408,11 +423,13 @@ impl QuotaPopover {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let availability = ring_availability(snapshot, context_available);
-        let visible = settings.visible_rings;
+        let configured = settings.visible_rings;
+        let effective = effective_ring_visibility(configured, availability);
+
         let selected_available = [
-            (visible.weekly, availability.weekly),
-            (visible.five_hour, availability.five_hour),
-            (visible.context, availability.context),
+            (effective.weekly, availability.weekly),
+            (effective.five_hour, availability.five_hour),
+            (effective.context, availability.context),
         ]
         .into_iter()
         .filter(|(selected, available)| *selected && *available)
@@ -471,25 +488,25 @@ impl QuotaPopover {
         let weekly = checkbox(
             "quota-weekly-ring",
             "Weekly",
-            visible.weekly,
+            effective.weekly,
             availability.weekly,
-            selected_available == 1 && visible.weekly,
+            selected_available == 1 && effective.weekly,
             RingSetting::Weekly,
         );
         let five_hour = checkbox(
             "quota-five-hour-ring",
             "5-hour",
-            visible.five_hour,
+            effective.five_hour,
             availability.five_hour,
-            selected_available == 1 && visible.five_hour,
+            selected_available == 1 && effective.five_hour,
             RingSetting::FiveHour,
         );
         let context = checkbox(
             "quota-context-ring",
             "Context",
-            visible.context,
+            effective.context,
             availability.context,
-            selected_available == 1 && visible.context,
+            selected_available == 1 && effective.context,
             RingSetting::Context,
         );
 
@@ -513,17 +530,11 @@ fn format_duration_label(value: String) -> String {
 struct ProviderRow {
     target: QuotaTarget,
     view: QuotaView,
-    expanded: bool,
+    is_active: bool,
 }
 
-fn should_render_standalone_context(
-    active_target: Option<&QuotaTarget>,
-    rows: &[ProviderRow],
-    context_available: bool,
-) -> bool {
-    context_available
-        && active_target
-            .is_some_and(|active_target| !rows.iter().any(|row| row.target == *active_target))
+fn should_render_standalone_context(rows: &[ProviderRow], context_available: bool) -> bool {
+    context_available && !rows.iter().any(|row| row.is_active)
 }
 
 #[derive(Clone, Copy)]
@@ -575,10 +586,12 @@ fn provider_rows(
                         .as_ref()
                         .is_some_and(QuotaError::disconnects_provider))
             {
-                return None;
+                if active != Some(&target) {
+                    return None;
+                }
             }
             Some(ProviderRow {
-                expanded: active == Some(&target),
+                is_active: active == Some(&target),
                 target,
                 view,
             })
@@ -592,9 +605,12 @@ fn provider_key(target: &QuotaTarget) -> String {
     format!("quota-provider-{:016x}", hasher.finish())
 }
 
-fn provider_error_text(view: &QuotaView) -> Option<String> {
+fn provider_error_text(view: &QuotaView, is_active: bool) -> Option<String> {
     let error = view.error.as_ref()?;
-    if view.snapshot.is_some() || (view.account.is_some() && !error.disconnects_provider()) {
+    if view.snapshot.is_some()
+        || is_active
+        || (view.account.is_some() && !error.disconnects_provider())
+    {
         Some(sanitized_error(error))
     } else {
         None
@@ -625,7 +641,7 @@ fn provider_subheading(
     now_unix_ms: i64,
 ) -> impl IntoElement {
     Label::new(format!(
-        "Last success {} · {} ago",
+        "Last refreshed {} · {} ago",
         absolute_time(snapshot.fetched_at_unix_ms),
         relative_age(snapshot.fetched_at_unix_ms, now_unix_ms)
     ))
@@ -635,24 +651,26 @@ fn provider_subheading(
 
 #[cfg(test)]
 fn provider_windows(snapshot: &QuotaSnapshot) -> Vec<ProviderWindow> {
-    let mut windows = snapshot
-        .windows
-        .iter()
-        .map(|window| ProviderWindow {
+    let mut windows = Vec::new();
+    if !snapshot.windows.is_empty() {
+        windows.extend(snapshot.windows.iter().map(|window| ProviderWindow {
             label: window.label.to_string(),
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
     if let Some(active_model_id) = snapshot.active_model_id.as_ref()
         && let Some(model_windows) = snapshot.model_windows.get(active_model_id)
+        && !model_windows.is_empty()
     {
         windows.extend(model_windows.iter().map(|window| ProviderWindow {
             label: window.label.to_string(),
         }));
     }
     for group in &snapshot.groups {
-        windows.extend(group.buckets.iter().map(|bucket| ProviderWindow {
-            label: bucket.window.label.to_string(),
-        }));
+        if !group.buckets.is_empty() {
+            windows.extend(group.buckets.iter().map(|bucket| ProviderWindow {
+                label: bucket.window.label.to_string(),
+            }));
+        }
     }
     windows
 }
@@ -727,7 +745,7 @@ fn sanitized_error(error: &QuotaError) -> String {
         QuotaError::MissingCredentials => "Quota credentials are not configured".to_string(),
         QuotaError::AmbiguousAccount => "Quota account could not be identified".to_string(),
         QuotaError::Cooldown => "Quota refresh is cooling down".to_string(),
-        QuotaError::Authentication(_) => "Quota authentication failed".to_string(),
+        QuotaError::Authentication(msg) => msg.to_string(),
         QuotaError::RateLimited { .. } => "Quota provider rate limit reached".to_string(),
         QuotaError::Provider(_) => "Quota provider request failed".to_string(),
     }
@@ -755,6 +773,29 @@ fn ring_availability(
         five_hour,
         context: context_available,
     }
+}
+
+fn effective_ring_visibility(
+    configured: QuotaRingVisibility,
+    available: QuotaRingVisibility,
+) -> QuotaRingVisibility {
+    let mut effective = QuotaRingVisibility {
+        weekly: configured.weekly && available.weekly,
+        five_hour: configured.five_hour && available.five_hour,
+        context: configured.context && available.context,
+    };
+
+    if !effective.weekly && !effective.five_hour && !effective.context {
+        if available.context {
+            effective.context = true;
+        } else if available.five_hour {
+            effective.five_hour = true;
+        } else if available.weekly {
+            effective.weekly = true;
+        }
+    }
+
+    effective
 }
 
 fn update_display_mode(fs: Option<Arc<dyn Fs>>, mode: settings::QuotaDisplayMode, cx: &App) {
@@ -836,7 +877,8 @@ mod tests {
     #[test]
     fn tooltip_and_popover_show_last_updated_without_lifecycle_labels() {
         let snapshot = snapshot_fetched_at(1_700_000_000_000);
-        let tooltip = super::super::indicator::render_tooltip_text(&snapshot, 1_700_000_018_000);
+        let tooltip =
+            super::super::indicator::render_tooltip_text(&snapshot, None, 1_700_000_018_000);
         let popover = render_popover_text(&snapshot, 1_700_000_018_000);
 
         assert!(tooltip.contains("Updated 18s ago"));
@@ -889,7 +931,7 @@ mod tests {
             rows.iter().map(|row| &row.target).collect::<Vec<_>>(),
             vec![&active, &other]
         );
-        assert!(rows[0].expanded);
+        assert!(rows[0].is_active);
         assert_ne!(provider_key(&active), provider_key(&other));
     }
 
@@ -918,18 +960,17 @@ mod tests {
         let connected = target("connected");
         let mut views = HashMap::default();
         views.insert(connected.clone(), view(Some(snapshot_fetched_at(0)), None));
-        let rows = provider_rows(std::slice::from_ref(&connected), Some(&active), &views);
+        let rows_without_active =
+            provider_rows(std::slice::from_ref(&connected), Some(&active), &views);
 
-        assert!(!rows.is_empty());
-        assert!(should_render_standalone_context(Some(&active), &rows, true));
+        views.insert(active.clone(), view(Some(snapshot_fetched_at(0)), None));
+        let rows_with_active = provider_rows(&[connected, active.clone()], Some(&active), &views);
+
+        assert!(!rows_without_active.is_empty());
+        assert!(should_render_standalone_context(&rows_without_active, true));
+        assert!(!should_render_standalone_context(&rows_with_active, true));
         assert!(!should_render_standalone_context(
-            Some(&connected),
-            &rows,
-            true
-        ));
-        assert!(!should_render_standalone_context(
-            Some(&active),
-            &rows,
+            &rows_without_active,
             false
         ));
     }
@@ -944,7 +985,7 @@ mod tests {
 
         let rows = provider_rows(&[active.clone(), other], Some(&active), &views);
 
-        assert!(!rows[1].expanded);
+        assert!(!rows[1].is_active);
     }
 
     #[test]
@@ -994,9 +1035,37 @@ mod tests {
         );
         account_only.snapshot = None;
         assert_eq!(
-            provider_error_text(&account_only),
+            provider_error_text(&account_only, false),
             Some("Quota provider request failed".to_string())
         );
+    }
+
+    #[test]
+    fn active_authentication_failure_remains_visible_with_guidance() {
+        let mut views = HashMap::default();
+        let target = target("provider");
+        let error = QuotaError::Authentication("re-authenticate Codex".into());
+        views.insert(target.clone(), view(None, Some(error)));
+
+        let rows = provider_rows(std::slice::from_ref(&target), Some(&target), &views);
+        assert_eq!(rows.len(), 1);
+
+        let error_text = provider_error_text(&rows[0].view, rows[0].is_active);
+        assert_eq!(error_text.as_deref(), Some("re-authenticate Codex"));
+    }
+
+    #[test]
+    fn inactive_authentication_failure_remains_filtered() {
+        let mut views = HashMap::default();
+        let active = target("active");
+        let inactive = target("inactive");
+        let error = QuotaError::Authentication("re-authenticate Codex".into());
+        views.insert(inactive.clone(), view(None, Some(error)));
+        views.insert(active.clone(), view(None, None));
+
+        let rows = provider_rows(&[inactive, active.clone()], Some(&active), &views);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, active);
     }
 
     #[test]
@@ -1105,12 +1174,88 @@ mod tests {
     }
 
     #[test]
-    fn errors_are_sanitized_for_warning_tooltips() {
-        let error = QuotaError::Provider("token=secret response body".into());
+    fn arbitrary_provider_error_payload_is_never_rendered() {
+        let error = QuotaError::Provider("token=secret response body user@ account_id".into());
 
         let sanitized = sanitized_error(&error);
 
         assert_eq!(sanitized, "Quota provider request failed");
+        assert!(!sanitized.contains("token"));
         assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("user@"));
+        assert!(!sanitized.contains("account_id"));
+    }
+
+    #[test]
+    fn empty_windows_and_groups_do_not_create_sections() {
+        let mut snapshot = snapshot_fetched_at(0);
+        snapshot.windows.clear();
+        snapshot.active_model_id = Some(Arc::from("model"));
+        snapshot
+            .model_windows
+            .insert(Arc::from("model"), Vec::new());
+        snapshot.groups.push(ai_usage::QuotaGroup {
+            id: Arc::from("group"),
+            display_name: "Group".into(),
+            description: None,
+            applies_to_model_ids: Vec::new(),
+            affects_severity: false,
+            buckets: Vec::new(),
+        });
+
+        let sections = provider_windows(&snapshot);
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn effective_visibility_forces_the_only_available_ring() {
+        let configured = QuotaRingVisibility {
+            weekly: false,
+            five_hour: false,
+            context: false,
+        };
+
+        let available = QuotaRingVisibility {
+            weekly: false,
+            five_hour: false,
+            context: true,
+        };
+
+        let effective = effective_ring_visibility(configured, available);
+
+        assert_eq!(
+            effective,
+            QuotaRingVisibility {
+                weekly: false,
+                five_hour: false,
+                context: true,
+            }
+        );
+
+        assert!(!configured.context);
+    }
+
+    #[test]
+    fn effective_visibility_preserves_configured_available_rings() {
+        let configured = QuotaRingVisibility {
+            weekly: true,
+            five_hour: false,
+            context: false,
+        };
+
+        let available = QuotaRingVisibility {
+            weekly: true,
+            five_hour: true,
+            context: true,
+        };
+
+        assert_eq!(
+            effective_ring_visibility(configured, available),
+            QuotaRingVisibility {
+                weekly: true,
+                five_hour: false,
+                context: false,
+            }
+        );
     }
 }
