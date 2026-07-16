@@ -17,6 +17,12 @@ use super::{ActiveQuotaTarget, popover::QuotaPopover};
 const FIVE_HOUR_SECONDS: u64 = 18_000;
 const WEEKLY_SECONDS: u64 = 604_800;
 
+const CONTEXT_RING_SIZE: f32 = 16.0;
+const CONTEXT_RING_STROKE_WIDTH: f32 = 2.0;
+const CONTEXT_RING_RADIUS: f32 = 6.0;
+const QUOTA_BAR_STACK_WIDTH: f32 = 12.0;
+const QUOTA_BAR_HEIGHT: f32 = 3.0;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RingKind {
     Weekly,
@@ -163,7 +169,7 @@ impl ContextQuotaIndicator {
             .child(if context_only {
                 self.render_context_only(cx)
             } else {
-                self.render_rings(&rings, snapshot, display_mode, cx)
+                self.render_compact_indicator(&rings, snapshot, display_mode, cx)
             })
             .hoverable_tooltip({
                 let context_usage = self.context_usage.clone();
@@ -206,22 +212,70 @@ impl ContextQuotaIndicator {
             .into_any_element()
     }
 
+    fn render_single_context_ring(
+        &self,
+        display_mode: settings::QuotaDisplayMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(context_usage) = self.context_usage.as_ref() else {
+            return div().size(px(CONTEXT_RING_SIZE)).into_any_element();
+        };
+
+        let used_ratio = context_used_ratio(&context_usage.token_usage);
+
+        CircularProgress::new(
+            context_fill(used_ratio, display_mode),
+            100.0,
+            px(CONTEXT_RING_SIZE),
+            cx,
+        )
+        .stroke_width(px(CONTEXT_RING_STROKE_WIDTH))
+        .radius(px(CONTEXT_RING_RADIUS))
+        .progress_color(tone_color(context_tone(used_ratio), cx))
+        .into_any_element()
+    }
+
+    fn render_compact_indicator(
+        &self,
+        rings: &[RingKind],
+        snapshot: Option<&QuotaSnapshot>,
+        display_mode: settings::QuotaDisplayMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let show_context = rings.contains(&RingKind::Context) && self.context_usage.is_some();
+        let quota_bars = quota_bar_kinds(rings);
+
+        let mut content = h_flex().items_center().gap_1();
+
+        if show_context {
+            content = content.child(self.render_single_context_ring(display_mode, cx));
+        }
+
+        if !quota_bars.is_empty() {
+            content = content.child(render_quota_bar_stack(
+                &quota_bars,
+                snapshot,
+                display_mode,
+                cx,
+            ));
+        }
+
+        content.into_any_element()
+    }
+
     fn render_context_only(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(context_usage) = self.context_usage.as_ref() else {
-            return div().size(px(16.)).into_any_element();
+            return div().size(px(CONTEXT_RING_SIZE)).into_any_element();
         };
         let usage = &context_usage.token_usage;
-        let used_ratio = context_used_ratio(usage);
         let display_mode = AgentSettings::get_global(cx).quota.display_mode;
-        let value = context_fill(used_ratio, display_mode);
-        let tone = context_tone(used_ratio);
         let max_output_tokens = usage.max_output_tokens.unwrap_or(0);
         let input_max_tokens = usage.max_tokens.saturating_sub(max_output_tokens);
         let layout = context_ring_layout(context_usage.show_split, &[RingKind::Context]);
         let ring = |value, tone| {
-            CircularProgress::new(value, 100.0, px(16.), cx)
-                .stroke_width(px(2.))
-                .radius(px(6.))
+            CircularProgress::new(value, 100.0, px(CONTEXT_RING_SIZE), cx)
+                .stroke_width(px(CONTEXT_RING_STROKE_WIDTH))
+                .radius(px(CONTEXT_RING_RADIUS))
                 .progress_color(tone_color(tone, cx))
         };
         if layout == ContextRingLayout::SplitSideBySide {
@@ -261,54 +315,8 @@ impl ContextQuotaIndicator {
                 )
                 .into_any_element()
         } else {
-            ring(value, tone).into_any_element()
+            self.render_single_context_ring(display_mode, cx)
         }
-    }
-
-    fn render_rings(
-        &self,
-        rings: &[RingKind],
-        snapshot: Option<&QuotaSnapshot>,
-        display_mode: settings::QuotaDisplayMode,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let size = px(16. + (rings.len().saturating_sub(1) * 4) as f32);
-        let mut container = div().relative().size(size);
-        for (index, kind) in rings.iter().enumerate() {
-            let radius = px(6. + ((rings.len() - index - 1) * 2) as f32);
-            let progress = match kind {
-                RingKind::Context => self.context_usage.as_ref().map(|context| {
-                    context_fill(context_used_ratio(&context.token_usage), display_mode)
-                }),
-                RingKind::Weekly | RingKind::FiveHour => snapshot
-                    .and_then(|snapshot| applicable_quota_window(snapshot, *kind))
-                    .and_then(|window| quota_fill(window, display_mode)),
-            };
-            let Some(progress) = progress else {
-                continue;
-            };
-            let tone = match kind {
-                RingKind::Context => self
-                    .context_usage
-                    .as_ref()
-                    .map(|context| context_tone(context_used_ratio(&context.token_usage)))
-                    .unwrap_or(RingTone::Normal),
-                RingKind::Weekly | RingKind::FiveHour => snapshot
-                    .and_then(|snapshot| applicable_quota_window(snapshot, *kind))
-                    .and_then(|window| window.remaining_percent)
-                    .map(quota_tone)
-                    .unwrap_or(RingTone::Normal),
-            };
-            container = container.child(
-                div().absolute().inset_0().child(
-                    CircularProgress::new(progress, 100., size, cx)
-                        .stroke_width(px(2.))
-                        .radius(radius)
-                        .progress_color(tone_color(tone, cx)),
-                ),
-            );
-        }
-        container.into_any_element()
     }
 }
 
@@ -451,6 +459,57 @@ fn tone_color(tone: RingTone, cx: &App) -> gpui::Hsla {
         RingTone::Warning => cx.theme().status().warning,
         RingTone::Critical => cx.theme().status().error,
     }
+}
+
+fn render_quota_bar(fill_percent: f32, tone: RingTone, cx: &App) -> AnyElement {
+    div()
+        .w(px(QUOTA_BAR_STACK_WIDTH))
+        .h(px(QUOTA_BAR_HEIGHT))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(cx.theme().colors().border_variant)
+        .child(
+            div()
+                .h_full()
+                .w(relative((fill_percent / 100.0).clamp(0.0, 1.0)))
+                .rounded_full()
+                .bg(tone_color(tone, cx)),
+        )
+        .into_any_element()
+}
+
+fn render_quota_bar_stack(
+    quota_bars: &[RingKind],
+    snapshot: Option<&QuotaSnapshot>,
+    display_mode: settings::QuotaDisplayMode,
+    cx: &App,
+) -> AnyElement {
+    let mut stack = v_flex()
+        .w(px(QUOTA_BAR_STACK_WIDTH))
+        .h(px(CONTEXT_RING_SIZE))
+        .justify_center()
+        .gap_0p5();
+
+    for kind in quota_bars.iter().copied() {
+        let Some(window) = snapshot.and_then(|snapshot| applicable_quota_window(snapshot, kind))
+        else {
+            continue;
+        };
+        let Some(fill_percent) = quota_fill(window, display_mode) else {
+            continue;
+        };
+        let Some(remaining_percent) = window.remaining_percent else {
+            continue;
+        };
+
+        stack = stack.child(render_quota_bar(
+            fill_percent,
+            quota_tone(remaining_percent),
+            cx,
+        ));
+    }
+
+    stack.into_any_element()
 }
 
 fn quota_lines(
@@ -781,6 +840,13 @@ fn compact_rings(
     effective_visibility(visibility, available_rings(snapshot, context_available))
 }
 
+fn quota_bar_kinds(rings: &[RingKind]) -> Vec<RingKind> {
+    [RingKind::FiveHour, RingKind::Weekly]
+        .into_iter()
+        .filter(|kind| rings.contains(kind))
+        .collect()
+}
+
 fn has_visible_content(
     snapshot: Option<&QuotaSnapshot>,
     visibility: RingVisibility,
@@ -869,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn rings_order_weekly_five_hour_context() {
+    fn compact_selection_tracks_weekly_five_hour_context() {
         let snapshot = snapshot(vec![
             quota("5h", FIVE_HOUR_SECONDS, 70.0),
             quota("weekly", WEEKLY_SECONDS, 80.0),
@@ -1054,6 +1120,43 @@ mod tests {
         assert_eq!(
             context_ring_layout(true, &[RingKind::Weekly, RingKind::Context]),
             ContextRingLayout::Single
+        );
+    }
+
+    #[test]
+    fn quota_bars_render_five_hour_above_weekly() {
+        let rings = vec![RingKind::Weekly, RingKind::FiveHour, RingKind::Context];
+
+        assert_eq!(
+            quota_bar_kinds(&rings),
+            vec![RingKind::FiveHour, RingKind::Weekly]
+        );
+    }
+
+    #[test]
+    fn missing_quota_bars_are_omitted_without_placeholders() {
+        assert_eq!(
+            quota_bar_kinds(&[RingKind::Weekly, RingKind::Context]),
+            vec![RingKind::Weekly]
+        );
+        assert_eq!(
+            quota_bar_kinds(&[RingKind::FiveHour, RingKind::Context]),
+            vec![RingKind::FiveHour]
+        );
+        assert!(quota_bar_kinds(&[RingKind::Context]).is_empty());
+    }
+
+    #[test]
+    fn quota_bar_fill_follows_remaining_and_used_modes() {
+        let window = quota("weekly", WEEKLY_SECONDS, 75.0);
+
+        assert_eq!(
+            quota_fill(&window, settings::QuotaDisplayMode::Remaining),
+            Some(75.0)
+        );
+        assert_eq!(
+            quota_fill(&window, settings::QuotaDisplayMode::Used),
+            Some(25.0)
         );
     }
 }

@@ -517,7 +517,7 @@ impl QuotaPopover {
             .pt_2()
             .child(Label::new("Display").weight(FontWeight::MEDIUM))
             .child(display_mode)
-            .child(Label::new("Compact rings").weight(FontWeight::MEDIUM))
+            .child(Label::new("Compact indicators").weight(FontWeight::MEDIUM))
             .child(h_flex().gap_2().children([weekly, five_hour, context]))
             .into_any_element()
     }
