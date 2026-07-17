@@ -40,6 +40,10 @@ impl QuotaCollector for CodexQuotaCollector {
         Arc::from(COLLECTOR_ID)
     }
 
+    fn quota_family_id(&self) -> Arc<str> {
+        Arc::from("openai-codex")
+    }
+
     fn display_name(&self) -> SharedString {
         PROVIDER_NAME.into()
     }

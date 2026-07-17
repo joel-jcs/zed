@@ -299,6 +299,7 @@ impl QuotaError {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaView {
     pub provider_id: Arc<str>,
+    pub quota_family_id: Arc<str>,
     pub provider_name: SharedString,
     pub account: Option<QuotaAccountSummary>,
     pub snapshot: Option<QuotaSnapshot>,

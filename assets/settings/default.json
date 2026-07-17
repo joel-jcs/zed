@@ -1148,10 +1148,6 @@
       "threshold": "90%",
     },
     "quota": {
-      "display_mode": "remaining",
-      "show_context_ring": true,
-      "show_five_hour_ring": true,
-      "show_weekly_ring": true,
       "auto_refresh": false,
       "refresh_interval_seconds": 30,
     },

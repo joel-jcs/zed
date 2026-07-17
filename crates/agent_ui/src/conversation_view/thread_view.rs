@@ -1324,8 +1324,7 @@ impl ThreadView {
                 let Some(store) = ai_usage::store(cx) else {
                     return;
                 };
-                let fs = self.thread.read(cx).project().read(cx).fs().clone();
-                let indicator = cx.new(|cx| ContextQuotaIndicator::new(target, store, fs, cx));
+                let indicator = cx.new(|cx| ContextQuotaIndicator::new(target, store, cx));
                 indicator.update(cx, |indicator, cx| {
                     indicator.set_context_usage(context_usage, cx);
                 });

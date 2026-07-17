@@ -11,6 +11,9 @@ pub struct QuotaFetchContext {
 
 pub trait QuotaCollector: Send + Sync {
     fn id(&self) -> Arc<str>;
+    fn quota_family_id(&self) -> Arc<str> {
+        self.id()
+    }
     fn display_name(&self) -> SharedString;
     fn supports(&self, target: &QuotaTarget) -> bool;
     fn minimum_ttl(&self) -> Duration;

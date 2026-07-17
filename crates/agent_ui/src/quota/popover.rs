@@ -1,49 +1,31 @@
 use std::{
     collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    sync::Arc,
 };
 
-use agent_settings::{AgentSettings, QuotaRingVisibility};
 use ai_usage::{QuotaError, QuotaResetSummary, QuotaSnapshot, QuotaTarget, QuotaView, QuotaWindow};
 use chrono::{DateTime, Local, Utc};
 use collections::HashMap;
-use fs::Fs;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     FontWeight, Render, Subscription, WeakEntity, Window, prelude::*,
 };
-use settings::{Settings as _, SettingsStore, update_settings_file};
 use ui::{
-    ButtonLike, Checkbox, CommonAnimationExt, Disclosure, IconButton, ToggleButtonGroup,
-    ToggleButtonSimple, Tooltip, prelude::*,
+    ButtonLike, CircularProgress, CommonAnimationExt, Divider, Icon, IconButton, Tooltip,
+    prelude::*,
 };
 use util::ResultExt as _;
 
 use super::{
     ActiveQuotaTarget,
     indicator::{
-        ContextQuotaIndicator, ContextUsageData, absolute_time, current_unix_ms, relative_age,
-        reset_value, window_value,
+        ContextQuotaIndicator, ContextUsageData, absolute_time, current_unix_ms,
+        quota_progress_color, relative_age, reset_value, window_display_label, window_value,
     },
 };
+use editor::{BUFFER_HEADER_PADDING, FILE_HEADER_HEIGHT};
 
-const FIVE_HOUR_SECONDS: u64 = 18_000;
-const WEEKLY_SECONDS: u64 = 604_800;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmptyPopoverContent {
-    Unavailable,
-    Context,
-}
-
-fn empty_popover_content(has_context: bool) -> EmptyPopoverContent {
-    if has_context {
-        EmptyPopoverContent::Context
-    } else {
-        EmptyPopoverContent::Unavailable
-    }
-}
+const OTHER_PROVIDERS_KEY: &str = "quota-other-providers";
 
 fn active_target_changed(current: Option<&QuotaTarget>, next: &QuotaTarget) -> bool {
     current != Some(next)
@@ -55,7 +37,6 @@ pub(crate) struct QuotaPopover {
     context_usage: Option<ContextUsageData>,
     context_usage_source: Option<WeakEntity<ContextQuotaIndicator>>,
     store: Entity<ai_usage::QuotaStore>,
-    fs: Option<Arc<dyn Fs>>,
     expanded: HashSet<String>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -66,8 +47,8 @@ impl QuotaPopover {
         active_target: Option<ActiveQuotaTarget>,
         context_usage: Option<ContextUsageData>,
         store: Entity<ai_usage::QuotaStore>,
-        fs: Option<Arc<dyn Fs>>,
         context_usage_source: Option<WeakEntity<ContextQuotaIndicator>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let active_target = active_target.map(|target| target.0);
@@ -83,15 +64,20 @@ impl QuotaPopover {
             .map(|target| HashSet::from([provider_key(target)]))
             .unwrap_or_default();
         let store_subscription = cx.observe(&store, |_, _, cx| cx.notify());
-        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
         let context_subscription = context_usage_source
             .as_ref()
             .and_then(WeakEntity::upgrade)
             .map(|source| cx.observe(&source, |_, _, cx| cx.notify()));
-        let mut subscriptions = vec![store_subscription, settings_subscription];
+        let mut subscriptions = vec![store_subscription];
         if let Some(context_subscription) = context_subscription {
             subscriptions.push(context_subscription);
         }
+
+        let focus_handle = cx.focus_handle();
+        cx.on_focus_out(&focus_handle, window, |_this, _event, _window, cx| {
+            cx.emit(DismissEvent);
+        })
+        .detach();
 
         Self {
             active_target,
@@ -99,9 +85,8 @@ impl QuotaPopover {
             context_usage,
             context_usage_source,
             store,
-            fs,
             expanded,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             _subscriptions: subscriptions,
         }
     }
@@ -116,7 +101,7 @@ impl Focusable for QuotaPopover {
 }
 
 impl Render for QuotaPopover {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_context_source(cx);
 
         let mut views = HashMap::default();
@@ -127,16 +112,8 @@ impl Render for QuotaPopover {
         }
         let rows = provider_rows(&self.targets, self.active_target.as_ref(), &views);
         let context_usage = self.current_context_usage(cx);
-        let standalone_context = should_render_standalone_context(&rows, context_usage.is_some());
         let any_fetching = views.values().any(|view| view.is_fetching);
-        let active_snapshot = self
-            .active_target
-            .as_ref()
-            .and_then(|target| views.get(target))
-            .and_then(|view| view.snapshot.as_ref())
-            .or_else(|| rows.first().and_then(|row| row.view.snapshot.as_ref()))
-            .cloned();
-        let settings = AgentSettings::get_global(cx).quota.clone();
+
         let popover = cx.entity().downgrade();
         let refresh_icon = Icon::new(IconName::RotateCw)
             .size(IconSize::Small)
@@ -149,7 +126,7 @@ impl Render for QuotaPopover {
 
         let now_unix_ms = current_unix_ms();
 
-        v_flex()
+        let mut content = v_flex()
             .elevation_2(cx)
             .w(px(360.))
             .max_w(px(420.))
@@ -158,74 +135,133 @@ impl Render for QuotaPopover {
             .overflow_y_scroll()
             .p_3()
             .gap_3()
-            .child(if rows.is_empty() {
-                match empty_popover_content(context_usage.is_some()) {
-                    EmptyPopoverContent::Context => {
-                        if let Some(context_usage) = context_usage.as_ref() {
-                            v_flex()
-                                .gap_2()
-                                .child(render_context_usage(context_usage, cx))
-                                .into_any_element()
-                        } else {
-                            v_flex()
-                                .gap_1()
-                                .child(Label::new("Quota unavailable"))
-                                .child(
-                                    Label::new("No connected provider has quota data.")
-                                        .color(Color::Muted),
-                                )
-                                .into_any_element()
-                        }
-                    }
-                    EmptyPopoverContent::Unavailable => v_flex()
-                        .gap_1()
-                        .child(Label::new("Quota unavailable"))
-                        .child(
-                            Label::new("No connected provider has quota data.").color(Color::Muted),
-                        )
-                        .into_any_element(),
-                }
-            } else {
+            .track_focus(&self.focus_handle);
+
+        if let Some(context_usage) = context_usage.as_ref() {
+            content = content.child(
                 v_flex()
-                    .gap_2()
-                    .children(rows.into_iter().map(|row| {
-                        self.render_provider(row, now_unix_ms, context_usage.as_ref(), cx)
-                    }))
-                    .when_some(
-                        context_usage.as_ref().filter(|_| standalone_context),
-                        |this, context_usage| this.child(render_context_usage(context_usage, cx)),
+                    .gap_1()
+                    .child(
+                        Label::new("Context")
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
                     )
-                    .into_any_element()
-            })
-            .child(self.render_settings(
-                settings,
-                active_snapshot.as_ref(),
-                context_usage.is_some(),
-                cx,
-            ))
+                    .child(render_context_usage(context_usage)),
+            );
+            content = content.child(Divider::horizontal());
+        }
+
+        let refresh_button = ButtonLike::new("refresh-quota")
+            .aria_label("Refresh quota")
+            .disabled(any_fetching)
+            .child(refresh_icon)
+            .on_click(move |_, _, cx| {
+                popover
+                    .update(cx, |popover, cx| {
+                        let targets = popover.targets.clone();
+                        let store = popover.store.clone();
+                        store.update(cx, |store, cx| {
+                            for target in targets {
+                                store.refresh(target, true, cx);
+                            }
+                        });
+                        cx.notify();
+                    })
+                    .log_err();
+            });
+
+        let quota_header = h_flex()
+            .justify_between()
             .child(
-                h_flex().justify_end().child(
-                    ButtonLike::new("refresh-quota")
-                        .aria_label("Refresh quota")
-                        .disabled(any_fetching)
-                        .child(refresh_icon)
-                        .on_click(move |_, _, cx| {
-                            popover
-                                .update(cx, |popover, cx| {
-                                    let targets = popover.targets.clone();
-                                    let store = popover.store.clone();
-                                    store.update(cx, |store, cx| {
-                                        for target in targets {
-                                            store.refresh(target, true, cx);
-                                        }
-                                    });
-                                    cx.notify();
-                                })
-                                .log_err();
-                        }),
-                ),
+                Label::new("Quota")
+                    .color(Color::Muted)
+                    .size(LabelSize::Small),
             )
-            .into_any_element()
+            .child(refresh_button);
+
+        content = content.child(quota_header);
+
+        let (active_row, other_rows) = partition_provider_rows(rows);
+
+        if active_row.is_none() && other_rows.is_empty() {
+            content = content.child(
+                v_flex()
+                    .gap_1()
+                    .child(Label::new("Quota unavailable"))
+                    .child(Label::new("No connected provider has quota data.").color(Color::Muted)),
+            );
+        } else {
+            let mut providers = v_flex().gap_2();
+            if let Some(row) = active_row {
+                providers = providers.child(self.render_provider(row, now_unix_ms, window, cx));
+            } else {
+                providers = providers.child(
+                    v_flex()
+                        .gap_1()
+                        .child(Label::new("Quota unavailable").color(Color::Muted))
+                        .child(
+                            Label::new("Active provider has no quota data.").color(Color::Muted),
+                        ),
+                );
+            }
+            if !other_rows.is_empty() {
+                let other_expanded = self.expanded.contains(OTHER_PROVIDERS_KEY);
+                let toggle_action = {
+                    let entity = cx.entity().downgrade();
+                    move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
+                        entity
+                            .update(cx, |popover, cx| {
+                                popover.toggle_expanded(OTHER_PROVIDERS_KEY, cx);
+                            })
+                            .log_err();
+                    }
+                };
+
+                let other_header = ButtonLike::new("other-providers-toggle")
+                    .style(ButtonStyle::Transparent)
+                    .size(ButtonSize::None)
+                    .full_width()
+                    .aria_label(if other_expanded {
+                        format!("Collapse other providers ({})", other_rows.len())
+                    } else {
+                        format!("Expand other providers ({})", other_rows.len())
+                    })
+                    .aria_expanded(other_expanded)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                Icon::new(if other_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .color(Color::Muted)
+                                .size(IconSize::Small),
+                            )
+                            .child(
+                                Label::new(format!("OTHER PROVIDERS ({})", other_rows.len()))
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            ),
+                    )
+                    .on_click(toggle_action);
+
+                let mut other_content = v_flex().gap_2().child(other_header);
+                if other_expanded {
+                    other_content = other_content.children(
+                        other_rows
+                            .into_iter()
+                            .map(|row| self.render_provider(row, now_unix_ms, window, cx)),
+                    );
+                }
+                providers = providers.child(other_content);
+            }
+            content = content.child(providers);
+        }
+
+        content.into_any_element()
     }
 }
 
@@ -242,15 +278,11 @@ impl QuotaPopover {
             return;
         }
 
-        let prev_key = self.active_target.as_ref().map(provider_key);
+        let previous = self.active_target.clone();
         self.active_target = Some(active_target.0);
         let Some(active_target) = self.active_target.clone() else {
             return;
         };
-
-        if let Some(prev) = prev_key {
-            self.expanded.remove(&prev);
-        }
 
         self.targets = self.store.update(cx, |store, cx| {
             let targets = store.targets_for_popover(Some(&active_target));
@@ -259,7 +291,15 @@ impl QuotaPopover {
             }
             targets
         });
-        self.expanded.insert(provider_key(&active_target));
+
+        sync_expanded_for_active_target(&mut self.expanded, previous.as_ref(), &active_target);
+    }
+
+    fn toggle_expanded(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.expanded.insert(key.to_owned()) {
+            self.expanded.remove(key);
+        }
+        cx.notify();
     }
 
     fn current_context_usage(&self, cx: &App) -> Option<ContextUsageData> {
@@ -278,31 +318,28 @@ impl QuotaPopover {
         &mut self,
         row: ProviderRow,
         now_unix_ms: i64,
-        context_usage: Option<&ContextUsageData>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = provider_key(&row.target);
-        let expanded = row.is_active || self.expanded.contains(&key);
-        let disclosure = Disclosure::new(key.clone(), expanded).on_click({
+        let expanded = self.expanded.contains(&key);
+        let toggle_action = {
             let key = key.clone();
             let entity = cx.entity().downgrade();
-            move |_, _, cx| {
+            move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
                 entity
                     .update(cx, |popover, cx| {
-                        if !popover.expanded.insert(key.clone()) {
-                            popover.expanded.remove(&key);
-                        }
-                        cx.notify();
+                        popover.toggle_expanded(&key, cx);
                     })
                     .log_err();
             }
-        });
+        };
 
-        let mut heading = row
+        let heading = row
             .view
             .snapshot
             .as_ref()
-            .map(|snapshot| provider_heading(snapshot, &row.target, now_unix_ms))
+            .map(provider_heading)
             .unwrap_or_else(|| row.view.provider_name.to_string());
         let warning = row
             .view
@@ -317,46 +354,81 @@ impl QuotaPopover {
                 .aria_label("Quota refresh warning")
                 .tooltip(Tooltip::text(sanitized_error(error)))
         });
-        if warning_icon.is_some() {
-            heading.push(' ');
-        }
+
+        let colors = cx.theme().colors();
+        let opaque_window =
+            cx.theme().window_background_appearance() == gpui::WindowBackgroundAppearance::Opaque;
+
+        let header_height = FILE_HEADER_HEIGHT as f32 * window.line_height();
+
+        let disclosure_icon = Icon::new(if expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        })
+        .color(Color::Muted)
+        .size(IconSize::Small);
+
+        let header_button = ButtonLike::new(format!("{key}-toggle"))
+            .style(ButtonStyle::Transparent)
+            .size(ButtonSize::None)
+            .height(header_height.into())
+            .full_width()
+            .aria_label(format!(
+                "{} provider {}",
+                if expanded { "Collapse" } else { "Expand" },
+                heading,
+            ))
+            .aria_expanded(expanded)
+            .on_click(toggle_action)
+            .child(
+                h_flex()
+                    .size_full()
+                    .p(BUFFER_HEADER_PADDING)
+                    .pl_1()
+                    .gap_1p5()
+                    .child(disclosure_icon)
+                    .child(v_flex().min_w_0().flex_1().child(Label::new(heading))),
+            );
 
         let header = h_flex()
-            .gap_1()
-            .child(disclosure)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .gap_0p5()
-                    .child(Label::new(heading))
-                    .when_some(row.view.snapshot.as_ref(), |this, snapshot| {
-                        this.child(provider_subheading(snapshot, &row.target, now_unix_ms))
-                    }),
-            )
-            .when_some(warning_icon, |this, warning| this.child(warning));
+            .w_full()
+            .h(header_height)
+            .rounded_sm()
+            .when(opaque_window, |this| {
+                this.bg(colors.editor_subheader_background)
+            })
+            .hover(|this| this.bg(colors.element_hover))
+            .child(div().min_w_0().flex_1().child(header_button))
+            .when_some(warning_icon, |this, warning| {
+                this.child(div().pr_2().child(warning))
+            });
 
         v_flex()
-            .gap_2()
+            .w_full()
+            .rounded_sm()
+            .border_1()
+            .border_color(colors.border)
             .child(header)
             .when(expanded, |this| {
-                let body_context = if row.is_active { context_usage } else { None };
-                this.child(self.render_provider_body(
-                    &row.view,
-                    row.is_active,
-                    now_unix_ms,
-                    body_context,
-                    cx,
-                ))
+                this.child(Divider::horizontal())
+                    .child(v_flex().p_3().child(self.render_provider_body(
+                        &key,
+                        &row.view,
+                        row.is_active,
+                        now_unix_ms,
+                        cx,
+                    )))
             })
             .into_any_element()
     }
 
     fn render_provider_body(
         &self,
+        provider_key: &str,
         view: &QuotaView,
         is_active: bool,
         now_unix_ms: i64,
-        context_usage: Option<&ContextUsageData>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(snapshot) = view.snapshot.as_ref() else {
@@ -371,22 +443,23 @@ impl QuotaPopover {
         };
 
         let mut content = v_flex().gap_2();
+
         if let Some(plan) = snapshot.plan.as_ref() {
             content = content.child(
                 h_flex()
                     .gap_1()
                     .child(Label::new("Plan").color(Color::Muted))
-                    .child(Label::new(plan.clone())),
+                    .child(Label::new(plan.to_uppercase())),
             );
         }
         if !snapshot.windows.is_empty() {
-            content = content.child(render_section("Quota", &snapshot.windows, now_unix_ms));
+            content = content.child(render_section("Quota", &snapshot.windows, now_unix_ms, cx));
         }
         if let Some(active_model_id) = snapshot.active_model_id.as_ref()
             && let Some(windows) = snapshot.model_windows.get(active_model_id)
             && !windows.is_empty()
         {
-            content = content.child(render_section("Active model", windows, now_unix_ms));
+            content = content.child(render_section("Active model", windows, now_unix_ms, cx));
         }
         for group in &snapshot.groups {
             if !group.buckets.is_empty() {
@@ -395,7 +468,12 @@ impl QuotaPopover {
                     .iter()
                     .map(|bucket| bucket.window.clone())
                     .collect::<Vec<_>>();
-                content = content.child(render_section(&group.display_name, &windows, now_unix_ms));
+                content = content.child(render_section(
+                    &group.display_name,
+                    &windows,
+                    now_unix_ms,
+                    cx,
+                ));
             }
         }
         if let Some(error) = provider_error_text(view, is_active) {
@@ -407,141 +485,114 @@ impl QuotaPopover {
             );
         }
         if let Some(resets) = snapshot.available_resets.as_ref() {
-            content = content.child(render_resets(resets, now_unix_ms));
+            content = content.child(self.render_resets(provider_key, resets, now_unix_ms, cx));
         }
-        if let Some(context_usage) = context_usage {
-            content = content.child(render_context_usage(context_usage, cx));
-        }
+        content = content.child(
+            h_flex().w_full().justify_end().child(
+                Label::new(format!(
+                    "Last refreshed {} · {} ago",
+                    absolute_time(snapshot.fetched_at_unix_ms),
+                    relative_age(snapshot.fetched_at_unix_ms, now_unix_ms)
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            ),
+        );
         content.into_any_element()
     }
 
-    fn render_settings(
+    fn render_resets(
         &self,
-        settings: agent_settings::AgentQuotaSettings,
-        snapshot: Option<&QuotaSnapshot>,
-        context_available: bool,
+        provider_key: &str,
+        summary: &QuotaResetSummary,
+        now_unix_ms: i64,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let availability = ring_availability(snapshot, context_available);
-        let configured = settings.visible_rings;
-        let effective = effective_ring_visibility(configured, availability);
+    ) -> impl IntoElement {
+        let model = reset_model(Some(summary), now_unix_ms);
+        if model.rows.is_empty() && model.available_count == 0 {
+            return v_flex().into_any_element();
+        }
 
-        let selected_available = [
-            (effective.weekly, availability.weekly),
-            (effective.five_hour, availability.five_hour),
-            (effective.context, availability.context),
-        ]
-        .into_iter()
-        .filter(|(selected, available)| *selected && *available)
-        .count();
-        let fs = self.fs.clone();
-        let display_mode = ToggleButtonGroup::single_row(
-            "quota-display-mode",
-            [
-                ToggleButtonSimple::new("Remaining", {
-                    let fs = fs.clone();
-                    move |_, _, cx| {
-                        update_display_mode(fs.clone(), settings::QuotaDisplayMode::Remaining, cx)
-                    }
-                })
-                .selected(settings.display_mode == settings::QuotaDisplayMode::Remaining),
-                ToggleButtonSimple::new("Used", {
-                    let fs = fs.clone();
-                    move |_, _, cx| {
-                        update_display_mode(fs.clone(), settings::QuotaDisplayMode::Used, cx)
-                    }
-                })
-                .selected(settings.display_mode == settings::QuotaDisplayMode::Used),
-            ],
-        )
-        .auto_width();
+        let resets_key = format!("{}-resets", provider_key);
+        let has_details = !model.rows.is_empty();
+        let resets_expanded = has_details && self.expanded.contains(&resets_key);
 
-        let checkbox = |id: &'static str,
-                        label: &'static str,
-                        selected: bool,
-                        available: bool,
-                        last_selected: bool,
-                        setting: RingSetting| {
-            let fs = self.fs.clone();
-            Checkbox::new(id, selected.into())
-                .disabled(!available || (selected && last_selected))
-                .on_click(move |state, _, cx| {
-                    if let Some(fs) = fs.clone() {
-                        let selected = matches!(state, ToggleState::Selected);
-                        update_settings_file(fs, cx, move |settings, _| {
-                            let quota = settings
-                                .agent
-                                .get_or_insert_default()
-                                .quota
-                                .get_or_insert_default();
-                            match setting {
-                                RingSetting::Weekly => quota.show_weekly_ring = Some(selected),
-                                RingSetting::FiveHour => quota.show_five_hour_ring = Some(selected),
-                                RingSetting::Context => quota.show_context_ring = Some(selected),
-                            }
-                        });
-                    }
-                })
-                .label(label)
+        let toggle_action = {
+            let resets_key = resets_key.clone();
+            let entity = cx.entity().downgrade();
+            move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
+                entity
+                    .update(cx, |popover, cx| {
+                        popover.toggle_expanded(&resets_key, cx);
+                    })
+                    .log_err();
+            }
         };
 
-        let weekly = checkbox(
-            "quota-weekly-ring",
-            "Weekly",
-            effective.weekly,
-            availability.weekly,
-            selected_available == 1 && effective.weekly,
-            RingSetting::Weekly,
-        );
-        let five_hour = checkbox(
-            "quota-five-hour-ring",
-            "5-hour",
-            effective.five_hour,
-            availability.five_hour,
-            selected_available == 1 && effective.five_hour,
-            RingSetting::FiveHour,
-        );
-        let context = checkbox(
-            "quota-context-ring",
-            "Context",
-            effective.context,
-            availability.context,
-            selected_available == 1 && effective.context,
-            RingSetting::Context,
-        );
-
         v_flex()
-            .gap_2()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
-            .pt_2()
-            .child(Label::new("Display").weight(FontWeight::MEDIUM))
-            .child(display_mode)
-            .child(Label::new("Compact indicators").weight(FontWeight::MEDIUM))
-            .child(h_flex().gap_2().children([weekly, five_hour, context]))
+            .gap_1()
+            .child(Label::new("Available Resets").weight(FontWeight::MEDIUM))
+            .child(if has_details {
+                ButtonLike::new(resets_key.clone())
+                    .style(ButtonStyle::Transparent)
+                    .size(ButtonSize::None)
+                    .full_width()
+                    .aria_label(if resets_expanded {
+                        format!("Collapse {} available resets", model.available_count)
+                    } else {
+                        format!("Expand {} available resets", model.available_count)
+                    })
+                    .aria_expanded(resets_expanded)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                Icon::new(if resets_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .color(Color::Muted)
+                                .size(IconSize::XSmall),
+                            )
+                            .child(
+                                Label::new(format!("{} available", model.available_count))
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .on_click(toggle_action)
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        Label::new(format!("{} available", model.available_count))
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            })
+            .when(resets_expanded, |this| {
+                this.child(
+                    v_flex()
+                        .pl_4()
+                        .gap_1()
+                        .children(model.rows.into_iter().map(|row| Label::new(row.text))),
+                )
+            })
             .into_any_element()
     }
 }
 
 fn format_duration_label(value: String) -> String {
-    format!("resets in {value}")
+    format!("Resets in {value}")
 }
 
 struct ProviderRow {
     target: QuotaTarget,
     view: QuotaView,
     is_active: bool,
-}
-
-fn should_render_standalone_context(rows: &[ProviderRow], context_available: bool) -> bool {
-    context_available && !rows.iter().any(|row| row.is_active)
-}
-
-#[derive(Clone, Copy)]
-enum RingSetting {
-    Weekly,
-    FiveHour,
-    Context,
 }
 
 #[cfg(test)]
@@ -556,6 +607,21 @@ struct ResetRow {
 struct ResetModel {
     available_count: u64,
     rows: Vec<ResetRow>,
+}
+
+fn partition_provider_rows(rows: Vec<ProviderRow>) -> (Option<ProviderRow>, Vec<ProviderRow>) {
+    let mut active = None;
+    let mut others = Vec::new();
+
+    for row in rows {
+        if row.is_active && active.is_none() {
+            active = Some(row);
+        } else {
+            others.push(row);
+        }
+    }
+
+    (active, others)
 }
 
 fn provider_rows(
@@ -575,7 +641,7 @@ fn provider_rows(
             .filter(|target| Some(*target) != active)
             .cloned(),
     );
-    ordered_targets
+    let filtered_rows = ordered_targets
         .into_iter()
         .filter_map(|target| {
             let view = views.get(&target)?.clone();
@@ -596,13 +662,43 @@ fn provider_rows(
                 view,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for row in filtered_rows {
+        if let Some(account) = &row.view.account {
+            let key = (
+                row.view.quota_family_id.clone(),
+                account.fingerprint.clone(),
+            );
+            if seen.insert(key) {
+                result.push(row);
+            }
+        } else {
+            result.push(row);
+        }
+    }
+    result
 }
 
 fn provider_key(target: &QuotaTarget) -> String {
     let mut hasher = DefaultHasher::new();
     target.hash(&mut hasher);
     format!("quota-provider-{:016x}", hasher.finish())
+}
+
+fn sync_expanded_for_active_target(
+    expanded: &mut HashSet<String>,
+    previous: Option<&QuotaTarget>,
+    next: &QuotaTarget,
+) {
+    if let Some(previous) = previous {
+        expanded.remove(&provider_key(previous));
+    }
+
+    expanded.insert(provider_key(next));
+    expanded.remove(OTHER_PROVIDERS_KEY);
 }
 
 fn provider_error_text(view: &QuotaView, is_active: bool) -> Option<String> {
@@ -617,36 +713,8 @@ fn provider_error_text(view: &QuotaView, is_active: bool) -> Option<String> {
     }
 }
 
-fn provider_heading(snapshot: &QuotaSnapshot, target: &QuotaTarget, _now_unix_ms: i64) -> String {
-    let account = snapshot
-        .account
-        .safe_label
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| snapshot.account.fingerprint.to_string());
-    let model = target
-        .model_name
-        .as_ref()
-        .map(ToString::to_string)
-        .or_else(|| snapshot.active_model_id.as_ref().map(ToString::to_string));
-    match model {
-        Some(model) => format!("{} · {} · {}", snapshot.provider_name, account, model),
-        None => format!("{} · {}", snapshot.provider_name, account),
-    }
-}
-
-fn provider_subheading(
-    snapshot: &QuotaSnapshot,
-    _target: &QuotaTarget,
-    now_unix_ms: i64,
-) -> impl IntoElement {
-    Label::new(format!(
-        "Last refreshed {} · {} ago",
-        absolute_time(snapshot.fetched_at_unix_ms),
-        relative_age(snapshot.fetched_at_unix_ms, now_unix_ms)
-    ))
-    .size(LabelSize::Small)
-    .color(Color::Muted)
+fn provider_heading(snapshot: &QuotaSnapshot) -> String {
+    snapshot.provider_name.to_string()
 }
 
 #[cfg(test)]
@@ -675,17 +743,34 @@ fn provider_windows(snapshot: &QuotaSnapshot) -> Vec<ProviderWindow> {
     windows
 }
 
-fn render_section(title: &str, windows: &[QuotaWindow], now_unix_ms: i64) -> impl IntoElement {
+fn render_section(
+    title: &str,
+    windows: &[QuotaWindow],
+    now_unix_ms: i64,
+    cx: &App,
+) -> impl IntoElement {
     v_flex()
         .gap_1()
         .child(Label::new(title).weight(FontWeight::MEDIUM))
         .children(windows.iter().map(|window| {
             let reset = reset_value(window, now_unix_ms);
+            let label = window_display_label(window);
+            let value_element = h_flex()
+                .gap_1p5()
+                .when_some(window.remaining_percent, |this, remaining| {
+                    this.child(
+                        CircularProgress::new(remaining as f32, 100.0, px(12.0), cx)
+                            .stroke_width(px(2.0))
+                            .progress_color(quota_progress_color(remaining, cx)),
+                    )
+                })
+                .child(Label::new(window_value(window)));
+
             h_flex()
                 .justify_between()
                 .gap_2()
-                .child(Label::new(window.label.clone()).color(Color::Muted))
-                .child(Label::new(window_value(window)))
+                .child(Label::new(label).color(Color::Muted))
+                .child(value_element)
                 .when_some(reset, |this, reset| {
                     this.child(Label::new(format_duration_label(reset)).color(Color::Muted))
                 })
@@ -708,7 +793,7 @@ fn reset_model(summary: Option<&QuotaResetSummary>, now_unix_ms: i64) -> ResetMo
                 .is_none_or(|expires| expires > now_unix_ms)
         })
         .map(|reset| {
-            let expiry = reset.expires_at_unix_ms.and_then(localized_date);
+            let expiry = reset.expires_at_unix_ms.and_then(localized_expiry);
             let text = match expiry.as_ref() {
                 Some(expiry) => format!("{} · Expires {expiry}", reset.title),
                 None => reset.title.to_string(),
@@ -722,22 +807,34 @@ fn reset_model(summary: Option<&QuotaResetSummary>, now_unix_ms: i64) -> ResetMo
     }
 }
 
-fn localized_date(unix_ms: i64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp_millis(unix_ms)
-        .map(|date| date.with_timezone(&Local).format("%x").to_string())
-}
-
-fn render_resets(summary: &QuotaResetSummary, now_unix_ms: i64) -> impl IntoElement {
-    let model = reset_model(Some(summary), now_unix_ms);
-    if model.rows.is_empty() && model.available_count == 0 {
-        return v_flex().into_any_element();
+fn format_utc_offset(offset_secs: i32) -> String {
+    if offset_secs == 0 {
+        "UTC-0".to_string()
+    } else {
+        let sign = if offset_secs < 0 { "-" } else { "+" };
+        let abs_secs = offset_secs.abs();
+        let hours = abs_secs / 3600;
+        let mins = (abs_secs % 3600) / 60;
+        if mins == 0 {
+            format!("UTC{}{}", sign, hours)
+        } else {
+            format!("UTC{}{}:{:02}", sign, hours, mins)
+        }
     }
-    v_flex()
-        .gap_1()
-        .child(Label::new("Available Resets").weight(FontWeight::MEDIUM))
-        .child(Label::new(format!("{} available", model.available_count)).color(Color::Muted))
-        .children(model.rows.into_iter().map(|row| Label::new(row.text)))
-        .into_any_element()
+}
+fn localized_expiry(unix_ms: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp_millis(unix_ms).map(|date| {
+        let local_date = date.with_timezone(&Local);
+        use chrono::Offset as _;
+        let offset_secs = local_date.offset().fix().local_minus_utc();
+        let offset_str = format_utc_offset(offset_secs);
+        format!(
+            "{}, {} ({})",
+            local_date.format("%x"),
+            local_date.format("%-I:%M %p"),
+            offset_str
+        )
+    })
 }
 
 fn sanitized_error(error: &QuotaError) -> String {
@@ -751,89 +848,21 @@ fn sanitized_error(error: &QuotaError) -> String {
     }
 }
 
-fn ring_availability(
-    snapshot: Option<&QuotaSnapshot>,
-    context_available: bool,
-) -> QuotaRingVisibility {
-    let (weekly, five_hour) = snapshot
-        .map(|snapshot| {
-            snapshot.applicable_windows().into_iter().fold(
-                (false, false),
-                |(weekly, five_hour), window| {
-                    (
-                        weekly || window.window_seconds == Some(WEEKLY_SECONDS),
-                        five_hour || window.window_seconds == Some(FIVE_HOUR_SECONDS),
-                    )
-                },
-            )
-        })
-        .unwrap_or_default();
-    QuotaRingVisibility {
-        weekly,
-        five_hour,
-        context: context_available,
-    }
-}
-
-fn effective_ring_visibility(
-    configured: QuotaRingVisibility,
-    available: QuotaRingVisibility,
-) -> QuotaRingVisibility {
-    let mut effective = QuotaRingVisibility {
-        weekly: configured.weekly && available.weekly,
-        five_hour: configured.five_hour && available.five_hour,
-        context: configured.context && available.context,
-    };
-
-    if !effective.weekly && !effective.five_hour && !effective.context {
-        if available.context {
-            effective.context = true;
-        } else if available.five_hour {
-            effective.five_hour = true;
-        } else if available.weekly {
-            effective.weekly = true;
-        }
-    }
-
-    effective
-}
-
-fn update_display_mode(fs: Option<Arc<dyn Fs>>, mode: settings::QuotaDisplayMode, cx: &App) {
-    if let Some(fs) = fs {
-        update_settings_file(fs, cx, move |settings, _| {
-            settings
-                .agent
-                .get_or_insert_default()
-                .quota
-                .get_or_insert_default()
-                .display_mode = Some(mode);
-        });
-    }
-}
-
-fn render_context_usage(
-    context: &ContextUsageData,
-    _cx: &mut Context<QuotaPopover>,
-) -> impl IntoElement {
+fn render_context_usage(context: &ContextUsageData) -> impl IntoElement {
     let used = crate::humanize_token_count(context.token_usage.used_tokens);
     let max = crate::humanize_token_count(context.token_usage.max_tokens);
+
     let mut content = v_flex()
         .gap_1()
-        .child(Label::new("Context").weight(FontWeight::MEDIUM))
         .child(Label::new(format!("{used} / {max} tokens")).color(Color::Muted));
+
     if let Some(cost) = &context.cost {
         content = content.child(Label::new(format!(
             "Cost: {:.2} {}",
             cost.amount, cost.currency
         )));
     }
-    if context.global_agents_md_loaded || context.project_rules_count > 0 {
-        content = content.child(Label::new(format!(
-            "Rules: {} global, {} project",
-            usize::from(context.global_agents_md_loaded),
-            context.project_rules_count
-        )));
-    }
+
     content
 }
 
@@ -849,6 +878,83 @@ pub(crate) fn render_popover_text(snapshot: &QuotaSnapshot, now_unix_ms: i64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn provider_row(id: &str, is_active: bool) -> ProviderRow {
+        let mut target = target(id);
+        target.provider_or_agent_id = Arc::from(id);
+        let mut view = view(id, None, None);
+        view.provider_id = Arc::from(id);
+        view.quota_family_id = Arc::from(id);
+        ProviderRow {
+            is_active,
+            target,
+            view,
+        }
+    }
+
+    #[test]
+    fn partition_preserves_inactive_provider_order() {
+        let first = provider_row("first", false);
+        let active = provider_row("active", true);
+        let second = provider_row("second", false);
+
+        let (active_row, others) = partition_provider_rows(vec![first, active, second]);
+
+        assert!(active_row.is_some());
+        assert_eq!(
+            others
+                .iter()
+                .map(|row| row.target.provider_or_agent_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"],
+        );
+    }
+
+    #[test]
+    fn partition_with_only_active_has_no_other_providers() {
+        let active = provider_row("active", true);
+
+        let (active_row, others) = partition_provider_rows(vec![active]);
+
+        assert!(active_row.is_some());
+        assert!(others.is_empty());
+    }
+
+    #[test]
+    fn active_target_expansion_synchronization() {
+        let mut expanded = HashSet::default();
+        let active = target("active");
+        let next = target("next");
+
+        expanded.insert(OTHER_PROVIDERS_KEY.to_string());
+        expanded.insert(provider_key(&active));
+
+        sync_expanded_for_active_target(&mut expanded, Some(&active), &next);
+
+        assert!(!expanded.contains(OTHER_PROVIDERS_KEY));
+        assert!(!expanded.contains(&provider_key(&active)));
+        assert!(expanded.contains(&provider_key(&next)));
+    }
+
+    #[test]
+    fn reset_details_start_collapsed() {
+        let provider_key = "quota-provider-test";
+        let resets_key = format!("{provider_key}-resets");
+        let expanded = HashSet::<String>::new();
+        let has_details = true;
+
+        let resets_expanded = has_details && expanded.contains(&resets_key);
+
+        assert!(!resets_expanded);
+    }
+
+    #[test]
+    fn format_utc_offset_formats_correctly() {
+        assert_eq!(format_utc_offset(0), "UTC-0");
+        assert_eq!(format_utc_offset(3600), "UTC+1");
+        assert_eq!(format_utc_offset(-18000), "UTC-5");
+        assert_eq!(format_utc_offset(19800), "UTC+5:30");
+    }
+
     use ai_usage::{
         QuotaAccountSummary, QuotaError, QuotaReset, QuotaResetSummary, QuotaSnapshot, QuotaTarget,
         QuotaTargetKind,
@@ -877,8 +983,7 @@ mod tests {
     #[test]
     fn tooltip_and_popover_show_last_updated_without_lifecycle_labels() {
         let snapshot = snapshot_fetched_at(1_700_000_000_000);
-        let tooltip =
-            super::super::indicator::render_tooltip_text(&snapshot, None, 1_700_000_018_000);
+        let tooltip = super::super::indicator::render_tooltip_text(&snapshot, 1_700_000_018_000);
         let popover = render_popover_text(&snapshot, 1_700_000_018_000);
 
         assert!(tooltip.contains("Updated 18s ago"));
@@ -906,9 +1011,14 @@ mod tests {
         target
     }
 
-    fn view(snapshot: Option<QuotaSnapshot>, error: Option<QuotaError>) -> QuotaView {
+    fn view(
+        provider_id: &str,
+        snapshot: Option<QuotaSnapshot>,
+        error: Option<QuotaError>,
+    ) -> QuotaView {
         QuotaView {
-            provider_id: Arc::from("provider"),
+            provider_id: Arc::from(provider_id),
+            quota_family_id: Arc::from(provider_id),
             provider_name: "Provider".into(),
             account: snapshot.as_ref().map(|snapshot| snapshot.account.clone()),
             snapshot,
@@ -919,11 +1029,25 @@ mod tests {
 
     #[test]
     fn active_provider_is_first_and_expanded() {
-        let active = target_with_model("provider", "active-model");
-        let other = target_with_model("provider", "other-model");
+        let active = target_with_model("active", "active-model");
+        let other = target_with_model("other", "other-model");
         let mut views = HashMap::default();
-        views.insert(active.clone(), view(Some(snapshot_fetched_at(0)), None));
-        views.insert(other.clone(), view(Some(snapshot_fetched_at(0)), None));
+        views.insert(
+            active.clone(),
+            view(
+                &active.provider_or_agent_id,
+                Some(snapshot_fetched_at(0)),
+                None,
+            ),
+        );
+        views.insert(
+            other.clone(),
+            view(
+                &other.provider_or_agent_id,
+                Some(snapshot_fetched_at(0)),
+                None,
+            ),
+        );
 
         let rows = provider_rows(&[other.clone(), active.clone()], Some(&active), &views);
 
@@ -946,33 +1070,47 @@ mod tests {
     }
 
     #[test]
-    fn empty_popover_preserves_context_content() {
-        assert_eq!(
-            empty_popover_content(false),
-            EmptyPopoverContent::Unavailable
-        );
-        assert_eq!(empty_popover_content(true), EmptyPopoverContent::Context);
+    fn family_based_deduplication_keeps_only_active_first() {
+        let active = target_with_model("openai-subscribed", "gpt-4o");
+        let inactive = target_with_model("codex", "codex-model");
+
+        let mut views = HashMap::default();
+        let mut active_view = view("mock1", Some(snapshot_fetched_at(0)), None);
+        active_view.quota_family_id = Arc::from("openai-codex");
+        let mut inactive_view = view("mock2", Some(snapshot_fetched_at(0)), None);
+        inactive_view.quota_family_id = Arc::from("openai-codex");
+
+        views.insert(active.clone(), active_view);
+        views.insert(inactive.clone(), inactive_view);
+
+        let rows = provider_rows(&[inactive.clone(), active.clone()], Some(&active), &views);
+
+        // Deduplication happens because family is "openai-codex" and account is the same ("account").
+        // The active one is ordered first, so only `active` is kept.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, active);
     }
 
     #[test]
-    fn context_renders_standalone_when_active_target_has_no_provider_row() {
-        let active = target("api");
-        let connected = target("connected");
+    fn different_accounts_are_not_deduplicated() {
+        let active = target_with_model("openai-subscribed", "gpt-4o");
+        let inactive = target_with_model("codex", "codex-model");
+
         let mut views = HashMap::default();
-        views.insert(connected.clone(), view(Some(snapshot_fetched_at(0)), None));
-        let rows_without_active =
-            provider_rows(std::slice::from_ref(&connected), Some(&active), &views);
+        let mut active_view = view("mock3", Some(snapshot_fetched_at(0)), None);
+        active_view.quota_family_id = Arc::from("openai-codex");
 
-        views.insert(active.clone(), view(Some(snapshot_fetched_at(0)), None));
-        let rows_with_active = provider_rows(&[connected, active.clone()], Some(&active), &views);
+        let mut inactive_snapshot = snapshot_fetched_at(0);
+        inactive_snapshot.account.fingerprint = Arc::from("other-account");
+        let mut inactive_view = view("mock4", Some(inactive_snapshot), None);
+        inactive_view.quota_family_id = Arc::from("openai-codex");
 
-        assert!(!rows_without_active.is_empty());
-        assert!(should_render_standalone_context(&rows_without_active, true));
-        assert!(!should_render_standalone_context(&rows_with_active, true));
-        assert!(!should_render_standalone_context(
-            &rows_without_active,
-            false
-        ));
+        views.insert(active.clone(), active_view);
+        views.insert(inactive.clone(), inactive_view);
+
+        let rows = provider_rows(&[inactive.clone(), active.clone()], Some(&active), &views);
+
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]
@@ -980,8 +1118,22 @@ mod tests {
         let active = target("active");
         let other = target("other");
         let mut views = HashMap::default();
-        views.insert(active.clone(), view(Some(snapshot_fetched_at(0)), None));
-        views.insert(other.clone(), view(Some(snapshot_fetched_at(0)), None));
+        views.insert(
+            active.clone(),
+            view(
+                &active.provider_or_agent_id,
+                Some(snapshot_fetched_at(0)),
+                None,
+            ),
+        );
+        views.insert(
+            other.clone(),
+            view(
+                &other.provider_or_agent_id,
+                Some(snapshot_fetched_at(0)),
+                None,
+            ),
+        );
 
         let rows = provider_rows(&[active.clone(), other], Some(&active), &views);
 
@@ -994,14 +1146,29 @@ mod tests {
         let missing = target("missing");
         let auth_failed = target("auth-failed");
         let mut views = HashMap::default();
-        views.insert(connected.clone(), view(Some(snapshot_fetched_at(0)), None));
+        views.insert(
+            connected.clone(),
+            view(
+                &connected.provider_or_agent_id,
+                Some(snapshot_fetched_at(0)),
+                None,
+            ),
+        );
         views.insert(
             missing.clone(),
-            view(None, Some(QuotaError::MissingCredentials)),
+            view(
+                &missing.provider_or_agent_id,
+                None,
+                Some(QuotaError::MissingCredentials),
+            ),
         );
         views.insert(
             auth_failed.clone(),
-            view(None, Some(QuotaError::Authentication("secret".into()))),
+            view(
+                &auth_failed.provider_or_agent_id,
+                None,
+                Some(QuotaError::Authentication("secret".into())),
+            ),
         );
 
         let rows = provider_rows(&[connected.clone(), missing, auth_failed], None, &views);
@@ -1019,6 +1186,7 @@ mod tests {
         views.insert(
             cached.clone(),
             view(
+                "mock5",
                 Some(snapshot_fetched_at(0)),
                 Some(QuotaError::Provider("temporary failure".into())),
             ),
@@ -1030,6 +1198,7 @@ mod tests {
         assert!(rows[0].view.snapshot.is_some());
 
         let mut account_only = view(
+            "mock6",
             Some(snapshot_fetched_at(0)),
             Some(QuotaError::Provider("temporary failure".into())),
         );
@@ -1045,7 +1214,10 @@ mod tests {
         let mut views = HashMap::default();
         let target = target("provider");
         let error = QuotaError::Authentication("re-authenticate Codex".into());
-        views.insert(target.clone(), view(None, Some(error)));
+        views.insert(
+            target.clone(),
+            view(&target.provider_or_agent_id, None, Some(error)),
+        );
 
         let rows = provider_rows(std::slice::from_ref(&target), Some(&target), &views);
         assert_eq!(rows.len(), 1);
@@ -1060,8 +1232,14 @@ mod tests {
         let active = target("active");
         let inactive = target("inactive");
         let error = QuotaError::Authentication("re-authenticate Codex".into());
-        views.insert(inactive.clone(), view(None, Some(error)));
-        views.insert(active.clone(), view(None, None));
+        views.insert(
+            inactive.clone(),
+            view(&inactive.provider_or_agent_id, None, Some(error)),
+        );
+        views.insert(
+            active.clone(),
+            view(&active.provider_or_agent_id, None, None),
+        );
 
         let rows = provider_rows(&[inactive, active.clone()], Some(&active), &views);
         assert_eq!(rows.len(), 1);
@@ -1205,57 +1383,5 @@ mod tests {
 
         let sections = provider_windows(&snapshot);
         assert!(sections.is_empty());
-    }
-
-    #[test]
-    fn effective_visibility_forces_the_only_available_ring() {
-        let configured = QuotaRingVisibility {
-            weekly: false,
-            five_hour: false,
-            context: false,
-        };
-
-        let available = QuotaRingVisibility {
-            weekly: false,
-            five_hour: false,
-            context: true,
-        };
-
-        let effective = effective_ring_visibility(configured, available);
-
-        assert_eq!(
-            effective,
-            QuotaRingVisibility {
-                weekly: false,
-                five_hour: false,
-                context: true,
-            }
-        );
-
-        assert!(!configured.context);
-    }
-
-    #[test]
-    fn effective_visibility_preserves_configured_available_rings() {
-        let configured = QuotaRingVisibility {
-            weekly: true,
-            five_hour: false,
-            context: false,
-        };
-
-        let available = QuotaRingVisibility {
-            weekly: true,
-            five_hour: true,
-            context: true,
-        };
-
-        assert_eq!(
-            effective_ring_visibility(configured, available),
-            QuotaRingVisibility {
-                weekly: true,
-                five_hour: false,
-                context: false,
-            }
-        );
     }
 }

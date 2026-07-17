@@ -195,6 +195,10 @@ impl QuotaCollector for OpenAiSubscribedQuotaCollector {
         Arc::from(PROVIDER_ID.0.as_ref())
     }
 
+    fn quota_family_id(&self) -> Arc<str> {
+        Arc::from("openai-codex")
+    }
+
     fn display_name(&self) -> SharedString {
         PROVIDER_NAME.0
     }

@@ -167,6 +167,7 @@ impl QuotaStore {
         }
         Some(QuotaView {
             provider_id: target.provider_or_agent_id.clone(),
+            quota_family_id: collector.quota_family_id(),
             provider_name: collector.display_name(),
             account,
             snapshot,

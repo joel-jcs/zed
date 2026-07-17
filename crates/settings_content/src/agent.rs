@@ -188,38 +188,8 @@ pub struct AutoCompactSettingsContent {
     pub threshold: Option<AutoCompactThreshold>,
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum QuotaDisplayMode {
-    #[default]
-    Remaining,
-    Used,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct AgentQuotaSettingsContent {
-    /// Whether to display quota values remaining or used.
-    ///
-    /// Default: remaining
-    pub display_mode: Option<QuotaDisplayMode>,
-
-    /// Whether to show the context quota ring.
-    ///
-    /// Default: true
-    pub show_context_ring: Option<bool>,
-
-    /// Whether to show the five-hour quota ring.
-    ///
-    /// Default: true
-    pub show_five_hour_ring: Option<bool>,
-
-    /// Whether to show the weekly quota ring.
-    ///
-    /// Default: true
-    pub show_weekly_ring: Option<bool>,
-
     /// Refresh active provider quota automatically.
     ///
     /// Default: false

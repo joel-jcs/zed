@@ -152,10 +152,8 @@ mod tests {
         };
         let first = ActiveQuotaTarget::from_language_model(native_model("native-a"));
         let second = ActiveQuotaTarget::from_language_model(native_model("native-b"));
-        let fs = fs::FakeFs::new(cx.executor());
-        let indicator = cx.update(|cx| {
-            cx.new(|cx| ContextQuotaIndicator::new(first.clone(), store.clone(), fs, cx))
-        });
+        let indicator = cx
+            .update(|cx| cx.new(|cx| ContextQuotaIndicator::new(first.clone(), store.clone(), cx)));
         indicator.update(cx, |indicator, cx| indicator.set_target(second.clone(), cx));
         cx.run_until_parked();
 
@@ -184,9 +182,8 @@ mod tests {
             Some("external-b"),
             Some("External B".into()),
         );
-        let fs = fs::FakeFs::new(cx.executor());
         let indicator =
-            cx.update(|cx| cx.new(|cx| ContextQuotaIndicator::new(first, store.clone(), fs, cx)));
+            cx.update(|cx| cx.new(|cx| ContextQuotaIndicator::new(first, store.clone(), cx)));
         indicator.update(cx, |indicator, cx| indicator.set_target(second.clone(), cx));
         cx.run_until_parked();
 
@@ -210,9 +207,8 @@ mod tests {
             Some("api-model"),
             Some("API model".into()),
         );
-        let fs = fs::FakeFs::new(cx.executor());
         let indicator = cx.update(|cx| {
-            cx.new(|cx| ContextQuotaIndicator::new(target.clone(), store.clone(), fs, cx))
+            cx.new(|cx| ContextQuotaIndicator::new(target.clone(), store.clone(), cx))
         });
         cx.run_until_parked();
 
